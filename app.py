@@ -88,7 +88,7 @@ CONFIG = {
     "username": os.environ.get("EM_INITIAL_ADMIN_USERNAME", "admin"),
     "password": os.environ.get("EM_INITIAL_ADMIN_PASSWORD", ""),
     "full_name": "Administrator",
-
+},
     "CURRENCY": "INR",
 }
 
