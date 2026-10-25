@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sign in · Expense Manager</title>
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-wrap">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-brand">
+        <span class="login-mark" aria-hidden="true">₹</span>
+        <div>
+          <h1 id="login-title">Expense Manager</h1>
+          <p>Restaurant finance records</p>
+        </div>
+      </div>
+
+      <form id="login-form" novalidate autocomplete="on">
+        <div class="field">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <div class="password-wrap">
+            <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+            <button type="button" class="link-btn" id="toggle-password" aria-label="Show password">Show</button>
+          </div>
+        </div>
+        <p class="form-error" id="login-error" role="alert" hidden></p>
+        <button type="submit" class="btn btn-primary btn-block" id="login-submit">Sign in</button>
+      </form>
+      <p class="login-note">Access is restricted to authorised users. Every sign-in attempt is recorded.</p>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='js/login.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Expense Manager</title>
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div class="app" id="app">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <div class="sidebar-brand">
+        <span class="brand-mark" aria-hidden="true">₹</span>
+        <span class="brand-name">Expense Manager</span>
+        <button class="icon-btn sidebar-close" id="sidebar-close" aria-label="Close menu">✕</button>
+      </div>
+      <nav class="nav" id="nav">
+        <a href="#/dashboard" data-view="dashboard" class="nav-link">Dashboard</a>
+        <a href="#/expenses" data-view="expenses" class="nav-link">Expenses</a>
+        <a href="#/categories" data-view="categories" class="nav-link">Categories</a>
+        <a href="#/history" data-view="history" class="nav-link" data-perm="audit:view">History &amp; audit</a>
+        <a href="#/reports" data-view="reports" class="nav-link" data-perm="export">Reports &amp; export</a>
+        <a href="#/users" data-view="users" class="nav-link" data-perm="user:manage">Users</a>
+        <a href="#/settings" data-view="settings" class="nav-link">Settings &amp; backups</a>
+      </nav>
+      <div class="sidebar-user">
+        <div class="avatar" id="user-avatar"></div>
+        <div class="sidebar-user-text">
+          <strong id="user-name"></strong>
+          <span id="user-role"></span>
+        </div>
+        <button class="link-btn" id="logout-btn">Sign out</button>
+      </div>
+    </aside>
+    <div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
+
+    <div class="main-col">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Open menu" aria-controls="sidebar">☰</button>
+        <h1 class="page-title" id="page-title">Dashboard</h1>
+        <div class="topbar-actions">
+          <button class="btn btn-primary" id="quick-add-btn" data-perm="expense:create">+ Add expense</button>
+        </div>
+      </header>
+      <main class="content" id="main" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div class="modal-root" id="modal-root" hidden>
+    <div class="modal-backdrop" id="modal-backdrop"></div>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" id="modal">
+      <div class="modal-head">
+        <h2 id="modal-title"></h2>
+        <button class="icon-btn" id="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <div class="toast-root" id="toast-root" aria-live="polite"></div>
+
+  <script id="bootstrap-user" type="application/json">{{ user_json|safe }}</script>
+  <script id="bootstrap-meta" type="application/json">{{ meta_json|safe }}</script>
+  <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/views.js') }}"></script>
+</body>
+</html>
