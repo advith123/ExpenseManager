@@ -1,0 +1,18 @@
+# /etc/systemd/system/expense-manager.service
+[Unit]
+Description=Restaurant Expense Manager (Flask + Gunicorn)
+After=network.target mongod.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/expense-manager
+Environment="MONGODB_USERNAME=CHANGE_ME"
+Environment="MONGODB_PASSWORD=CHANGE_ME"
+Environment="EM_SECRET_KEY=CHANGE_ME_TO_A_LONG_RANDOM_STRING"
+Environment="EM_SECURE_COOKIES=1"
+ExecStart=/opt/expense-manager/venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 --timeout 120 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
