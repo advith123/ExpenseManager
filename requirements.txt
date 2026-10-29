@@ -2,3 +2,4 @@ Flask>=3.0
 pymongo>=4.6
 dnspython>=2.4
 gunicorn>=21.2
+reportlab>=4.0

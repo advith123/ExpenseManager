@@ -1,15 +1,13 @@
 """
-Restaurant Expense Manager
---------------------------
-Single-file Flask backend backed by MongoDB (PyMongo).
+Firm Expense Manager  —  projects, partners, split payments, audit, backups.
+Flask + MongoDB (PyMongo). Single-file backend.
 
 Run:
     pip install -r requirements.txt
     python app.py
 
-Default login (change the password on first login):
-    username: admin
-    password: Admin@12345
+Default login (you must change the password on first sign-in):
+    username: admin      password: Admin@12345
 """
 
 import csv
@@ -21,46 +19,30 @@ import re
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from flask import (
-    Flask,
-    Response,
-    abort,
-    g,
-    jsonify,
-    redirect,
-    render_template,
-    request,
-    send_file,
-    session,
-    url_for,
-)
+from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request, send_file, session, url_for
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import seed_data
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 def build_mongo_uri():
-    """
-    Pick the MongoDB connection string from, in order:
-      1. MONGODB_URI / EM_MONGO_URI  (full connection string)
-      2. MONGODB_USERNAME + MONGODB_PASSWORD + MONGODB_HOST  (Atlas style)
-      3. local MongoDB on localhost:27017
-    Passwords are URL-encoded automatically, so special characters are safe.
-    """
+    """MONGODB_URI, else MONGODB_USERNAME + MONGODB_PASSWORD (Atlas), else local MongoDB."""
     from urllib.parse import quote_plus
     full = os.environ.get("MONGODB_URI") or os.environ.get("EM_MONGO_URI")
     if full:
         return full
-    user = os.environ.get("MONGODB_USERNAME")
-    pwd = os.environ.get("MONGODB_PASSWORD")
+    user, pwd = os.environ.get("MONGODB_USERNAME"), os.environ.get("MONGODB_PASSWORD")
     host = os.environ.get("MONGODB_HOST", "expensemanager.exoz8sx.mongodb.net")
     if user and pwd:
         return f"mongodb+srv://{quote_plus(user)}:{quote_plus(pwd)}@{host}/?retryWrites=true&w=majority&appName=ExpenseManager"
@@ -68,43 +50,31 @@ def build_mongo_uri():
 
 
 CONFIG = {
-    # MongoDB connection — see build_mongo_uri() above for the environment variables.
     "MONGO_URI": build_mongo_uri(),
     "DB_NAME": os.environ.get("EM_DB_NAME", "restaurant_expense_manager"),
-    # Flask session signing key. Set EM_SECRET_KEY in production.
-    "SECRET_KEY": os.environ.get("EM_SECRET_KEY", ""),
-    "SESSION_IDLE_MINUTES": 30,       # auto logout after inactivity
-    "SESSION_ABSOLUTE_HOURS": 12,     # hard logout regardless of activity
+    "SECRET_KEY": os.environ.get("EM_SECRET_KEY", "change-this-secret-key-before-going-live"),
+    "FIRM_NAME": os.environ.get("EM_FIRM_NAME", "Our Firm"),
+    "SESSION_IDLE_MINUTES": 30,
+    "SESSION_ABSOLUTE_HOURS": 12,
     "MAX_LOGIN_ATTEMPTS": 5,
     "LOCKOUT_MINUTES": 15,
     "BACKUP_DIR": os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups"),
-    "BACKUP_INTERVAL_HOURS": 24,        # daily safety backup even when nothing changed
-    "BACKUPS_TO_KEEP": 14,              # how many daily scheduled files to keep
-    "BACKUP_ON_CHANGE": True,           # write a JSON snapshot after every change
-    "BACKUP_DEBOUNCE_SECONDS": 3,       # group rapid changes into one file
-    "BACKUP_RETENTION_DAYS": 30,        # keep every change-snapshot for this many days, then one per day
-    "SECURE_COOKIES": os.environ.get("EM_SECURE_COOKIES", "0") == "1",  # set to 1 behind HTTPS
-    "DEFAULT_ADMIN": {
-    "username": os.environ.get("EM_INITIAL_ADMIN_USERNAME", "admin"),
-    "password": os.environ.get("EM_INITIAL_ADMIN_PASSWORD", ""),
-    "full_name": "Administrator",
-},
+    "BACKUP_ON_CHANGE": True,        # write a backup after every change
+    "BACKUP_DEBOUNCE_SECONDS": 3,    # group rapid changes into one write
+    "BACKUP_COPIES": 3,              # identical copies kept in backups/copy_1, copy_2, copy_3
+    "BACKUP_HISTORY_DAYS": 30,       # one dated copy per day kept in backups/history/
+    "BACKUP_INTERVAL_HOURS": 24,     # make sure a daily history copy exists even with no changes
+    "SECURE_COOKIES": os.environ.get("EM_SECURE_COOKIES", "0") == "1",
+    "DEFAULT_ADMIN": {"username": "admin", "password": "Admin@12345", "full_name": "Administrator"},
     "CURRENCY": "INR",
+    "IMPORT_SEED_LEDGER": True,   # import seed_data.py on first run (empty database)
 }
 
-ROLES = ["admin", "manager", "accountant", "viewer"]
-
+ROLES = ["admin", "editor", "viewer"]
 ROLE_PERMISSIONS = {
     "admin": {"*"},
-    "manager": {
-        "expense:view", "expense:create", "expense:edit", "expense:delete", "expense:restore",
-        "expense:view_deleted", "category:view", "category:manage", "export", "audit:view",
-        "backup:create", "dashboard:customize",
-    },
-    "accountant": {
-        "expense:view", "expense:create", "expense:edit", "expense:view_deleted", "category:view",
-        "export", "audit:view", "backup:create", "dashboard:customize",
-    },
+    "editor": {"expense:view", "expense:create", "expense:edit", "expense:view_deleted", "category:view", "category:manage",
+               "export", "audit:view", "dashboard:customize", "backup:create"},
     "viewer": {"expense:view", "category:view", "export", "dashboard:customize"},
 }
 
@@ -112,85 +82,50 @@ PAYMENT_METHODS = ["Cash", "UPI", "Bank Transfer", "Card", "Cheque", "Other"]
 PAYMENT_STATUSES = ["Paid", "Pending", "Partially Paid", "Reimbursed"]
 EXPENSE_TYPES = ["Setup", "Operational", "Capital", "Recurring", "One-time"]
 
-DEFAULT_CATEGORIES = {
-    "Interiors and Civil Work": ["Civil Construction", "Flooring", "Painting", "False Ceiling", "Interior Finishing"],
-    "Kitchen Equipment": ["Cooking Equipment", "Refrigeration", "Exhaust and Ventilation", "Kitchen Utensils"],
-    "Furniture and Fixtures": ["Dining Tables", "Chairs", "Majlis Seating", "Decorative Fixtures"],
-    "Rent and Security Deposit": ["Monthly Rent", "Security Deposit", "Maintenance Charges"],
-    "Electrical and Plumbing": ["Electrical Wiring", "Lighting", "Plumbing Materials", "Installation Charges"],
-    "Licenses and Registrations": ["FSSAI License", "Trade License", "GST Registration", "Fire NOC"],
-    "Raw Materials and Groceries": ["Meat and Poultry", "Vegetables", "Dairy", "Spices and Dry Goods"],
-    "Staff Salaries": ["Kitchen Staff", "Service Staff", "Management"],
-    "Marketing and Advertising": ["Social Media", "Print", "Signage", "Promotions"],
-    "Packaging and Delivery": ["Packaging Material", "Delivery Platform Fees"],
-    "Utilities and Maintenance": ["Electricity", "Water", "Gas", "Repairs"],
-    "Transportation": ["Fuel", "Vehicle Hire", "Logistics"],
-    "Miscellaneous Expenses": [],
-}
+# Fields on the expense form that each project can switch on/off or make required.
+OPTIONAL_FIELDS = [
+    ("vendor", "Vendor / payee"), ("payment_method", "Payment method"), ("payment_reference", "Payment reference"),
+    ("payment_status", "Payment status"), ("notes", "Notes"), ("receipt_reference", "Receipt / invoice reference"),
+    ("expense_type", "Expense type"), ("project_phase", "Phase"),
+]
+DEFAULT_FIELD_CONFIG = {k: {"enabled": k in ("vendor", "payment_method", "notes"), "required": False} for k, _ in OPTIONAL_FIELDS}
+CUSTOM_FIELD_TYPES = ["text", "number", "date", "select"]
 
 DASHBOARD_WIDGETS = [
     {"id": "total_expenses", "name": "Total expenses", "size": "small"},
-    {"id": "transaction_count", "name": "Number of transactions", "size": "small"},
-    {"id": "average_expense", "name": "Average per transaction", "size": "small"},
+    {"id": "transaction_count", "name": "Number of expenses", "size": "small"},
+    {"id": "average_expense", "name": "Average per expense", "size": "small"},
     {"id": "largest_expense", "name": "Largest single expense", "size": "small"},
+    {"id": "partner_summary", "name": "Partner contributions", "size": "large"},
     {"id": "monthly_trend", "name": "Expense trend", "size": "large"},
     {"id": "by_category", "name": "Spend by category", "size": "large"},
     {"id": "by_subcategory", "name": "Spend by subcategory", "size": "medium"},
+    {"id": "by_partner_chart", "name": "Who paid (chart)", "size": "medium"},
     {"id": "by_payment_method", "name": "Payment methods", "size": "medium"},
     {"id": "top_vendors", "name": "Top vendors", "size": "medium"},
-    {"id": "recent_transactions", "name": "Recent transactions", "size": "large"},
-    {"id": "pending_payments", "name": "Pending payments", "size": "medium"},
+    {"id": "recent_transactions", "name": "Recent expenses", "size": "large"},
 ]
-
-DEFAULT_LAYOUTS = {
-    "admin": ["total_expenses", "transaction_count", "average_expense", "largest_expense", "monthly_trend",
-              "by_category", "by_subcategory", "by_payment_method", "top_vendors", "pending_payments",
-              "recent_transactions"],
-    "manager": ["total_expenses", "transaction_count", "pending_payments", "monthly_trend", "by_category",
-                "top_vendors", "recent_transactions"],
-    "accountant": ["total_expenses", "transaction_count", "average_expense", "by_payment_method", "pending_payments",
-                   "monthly_trend", "by_category", "by_subcategory", "recent_transactions"],
-    "viewer": ["total_expenses", "transaction_count", "monthly_trend", "by_category", "recent_transactions"],
-}
+DEFAULT_LAYOUT = ["total_expenses", "transaction_count", "average_expense", "largest_expense", "partner_summary",
+                  "monthly_trend", "by_category", "by_partner_chart", "by_subcategory", "recent_transactions"]
 
 # ---------------------------------------------------------------------------
-# App and database setup
+# App and database
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("expense-manager")
 
-if not CONFIG["SECRET_KEY"]:
-    raise RuntimeError(
-        "EM_SECRET_KEY must be set before starting the application."
-    )
-    
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config.update(
-    SECRET_KEY=CONFIG["SECRET_KEY"],
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=CONFIG["SECURE_COOKIES"],
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=CONFIG["SESSION_ABSOLUTE_HOURS"]),
-    MAX_CONTENT_LENGTH=25 * 1024 * 1024,
-    JSON_SORT_KEYS=False,
+    SECRET_KEY=CONFIG["SECRET_KEY"], SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=CONFIG["SECURE_COOKIES"], PERMANENT_SESSION_LIFETIME=timedelta(hours=CONFIG["SESSION_ABSOLUTE_HOURS"]),
+    MAX_CONTENT_LENGTH=25 * 1024 * 1024, JSON_SORT_KEYS=False,
 )
 
 client = MongoClient(CONFIG["MONGO_URI"], serverSelectionTimeoutMS=10000)
 db = client[CONFIG["DB_NAME"]]
-
-
-def check_database_connection():
-    try:
-        client.admin.command("ping")
-        log.info("Connected to MongoDB (database '%s')", CONFIG["DB_NAME"])
-    except Exception as exc:
-        raise SystemExit(
-            "Could not connect to MongoDB: %s\n"
-            "Check MONGODB_USERNAME / MONGODB_PASSWORD (or MONGODB_URI) and that your IP is allowed in Atlas → Network Access." % exc
-        )
-
 users_col = db["users"]
+projects_col = db["projects"]
 expenses_col = db["expenses"]
 categories_col = db["categories"]
 revisions_col = db["expense_revisions"]
@@ -201,7 +136,6 @@ backup_logs_col = db["backup_logs"]
 counters_col = db["counters"]
 idempotency_col = db["idempotency_keys"]
 
-# In-memory login attempt tracker: key -> {"count": int, "locked_until": datetime}
 _login_attempts = {}
 _login_lock = threading.Lock()
 
@@ -210,64 +144,38 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+def check_database_connection():
+    try:
+        client.admin.command("ping")
+        log.info("Connected to MongoDB (database '%s')", CONFIG["DB_NAME"])
+    except Exception as exc:
+        raise SystemExit("Could not connect to MongoDB: %s\nCheck MONGODB_USERNAME / MONGODB_PASSWORD (or MONGODB_URI) "
+                         "and that your IP is allowed in Atlas → Network Access." % exc)
+
+
 def ensure_indexes():
     users_col.create_index([("username", ASCENDING)], unique=True)
     expenses_col.create_index([("expense_id", ASCENDING)], unique=True)
-    expenses_col.create_index([("transaction_date", DESCENDING)])
-    expenses_col.create_index([("category_id", ASCENDING), ("subcategory_id", ASCENDING)])
-    expenses_col.create_index([("status", ASCENDING), ("transaction_date", DESCENDING)])
+    expenses_col.create_index([("project_id", ASCENDING), ("status", ASCENDING), ("transaction_date", DESCENDING)])
+    expenses_col.create_index([("project_id", ASCENDING), ("category_id", ASCENDING), ("subcategory_id", ASCENDING)])
+    expenses_col.create_index([("payments.partner_id", ASCENDING)])
     expenses_col.create_index([("vendor", ASCENDING)])
-    expenses_col.create_index([("payment_method", ASCENDING)])
-    expenses_col.create_index([("payment_status", ASCENDING)])
     expenses_col.create_index([("amount", ASCENDING)])
-    expenses_col.create_index([("description", "text"), ("vendor", "text"), ("notes", "text")])
-    categories_col.create_index([("parent_id", ASCENDING), ("name", ASCENDING)])
+    categories_col.create_index([("project_id", ASCENDING), ("parent_id", ASCENDING), ("name", ASCENDING)])
     revisions_col.create_index([("expense_id", ASCENDING), ("revision", ASCENDING)])
     audit_col.create_index([("at", DESCENDING)])
     audit_col.create_index([("entity_id", ASCENDING)])
-    prefs_col.create_index([("user_id", ASCENDING)], unique=True)
+    audit_col.create_index([("project_id", ASCENDING), ("at", DESCENDING)])
+    for stale in ("user_id_1",):
+        try:
+            if stale in prefs_col.index_information():
+                prefs_col.drop_index(stale)
+        except Exception as exc:  # index may not exist on a fresh database
+            log.debug("Index cleanup skipped: %s", exc)
+    prefs_col.create_index([("user_id", ASCENDING), ("project_id", ASCENDING)], unique=True)
     filters_col.create_index([("user_id", ASCENDING)])
     idempotency_col.create_index([("created_at", ASCENDING)], expireAfterSeconds=86400)
     idempotency_col.create_index([("key", ASCENDING), ("user_id", ASCENDING)], unique=True)
-
-
-def seed_defaults():
-    """Create the first admin user and default categories if the database is empty."""
-    if users_col.count_documents({}) == 0:
-        admin = CONFIG["DEFAULT_ADMIN"]
-        users_col.insert_one({
-            "username": admin["username"],
-            "full_name": admin["full_name"],
-            "password_hash": generate_password_hash(admin["password"]),
-            "role": "admin",
-            "active": True,
-            "must_change_password": True,
-            "session_version": 1,
-            "created_at": utcnow(),
-            "last_login_at": None,
-        })
-        log.info("Created default admin user '%s'", admin["username"])
-
-    if categories_col.count_documents({}) == 0:
-        order = 0
-        for parent_name, children in DEFAULT_CATEGORIES.items():
-            order += 1
-            parent = {
-                "name": parent_name, "parent_id": None, "path": [parent_name], "path_ids": [],
-                "level": 0, "description": "", "status": "active", "sort_order": order,
-                "created_at": utcnow(), "is_default": True,
-            }
-            pid = categories_col.insert_one(parent).inserted_id
-            categories_col.update_one({"_id": pid}, {"$set": {"path_ids": [str(pid)]}})
-            for i, child_name in enumerate(children):
-                child = {
-                    "name": child_name, "parent_id": str(pid), "path": [parent_name, child_name],
-                    "path_ids": [str(pid)], "level": 1, "description": "", "status": "active",
-                    "sort_order": i + 1, "created_at": utcnow(), "is_default": True,
-                }
-                cid = categories_col.insert_one(child).inserted_id
-                categories_col.update_one({"_id": cid}, {"$set": {"path_ids": [str(pid), str(cid)]}})
-        log.info("Seeded default categories")
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +183,6 @@ def seed_defaults():
 # ---------------------------------------------------------------------------
 
 def serialize(doc):
-    """Convert ObjectId and datetime values into JSON-friendly values."""
     if isinstance(doc, list):
         return [serialize(d) for d in doc]
     if isinstance(doc, dict):
@@ -305,12 +212,13 @@ def to_oid(value):
 
 
 def parse_date(value, end_of_day=False):
-    """Parse YYYY-MM-DD (or ISO datetime) into a timezone-aware UTC datetime."""
     if not value:
         return None
     value = str(value).strip()
     try:
-        if len(value) == 10:
+        if re.fullmatch(r"\d{1,2}-\d{1,2}-\d{4}", value):
+            d = datetime.strptime(value, "%d-%m-%Y")
+        elif len(value) == 10:
             d = datetime.strptime(value, "%Y-%m-%d")
         else:
             d = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -323,28 +231,24 @@ def parse_date(value, end_of_day=False):
     return d.replace(tzinfo=timezone.utc)
 
 
-def parse_amount(value):
+def parse_amount(value, allow_zero=False):
     try:
-        amount = round(float(str(value).replace(",", "")), 2)
+        amount = round(float(str(value).replace(",", "").strip() or 0), 2)
     except (TypeError, ValueError):
         return None
-    if amount <= 0 or amount > 1_000_000_000:
+    if amount < 0 or (amount == 0 and not allow_zero) or amount > 1_000_000_000:
         return None
     return amount
 
 
 def clean_str(value, max_len=500):
-    if value is None:
-        return ""
-    return str(value).strip()[:max_len]
+    return "" if value is None else str(value).strip()[:max_len]
 
 
 def next_expense_id():
     year = utcnow().year
-    counter = counters_col.find_one_and_update(
-        {"_id": f"expense_{year}"}, {"$inc": {"seq": 1}}, upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+    counter = counters_col.find_one_and_update({"_id": f"expense_{year}"}, {"$inc": {"seq": 1}}, upsert=True,
+                                               return_document=ReturnDocument.AFTER)
     return f"EXP-{year}-{counter['seq']:05d}"
 
 
@@ -355,33 +259,8 @@ def json_error(message, status=400, **extra):
 
 
 def client_ip():
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "unknown"
-
-
-def record_audit(action, entity_type, entity_id, details=None, user=None):
-    user = user or getattr(g, "user", None)
-    audit_col.insert_one({
-        "action": action,
-        "entity_type": entity_type,
-        "entity_id": str(entity_id) if entity_id is not None else None,
-        "user_id": str(user["_id"]) if user else None,
-        "user_name": user.get("full_name") or user.get("username") if user else "system",
-        "at": utcnow(),
-        "ip": client_ip() if request else None,
-        "details": details or {},
-    })
-    if action in DATA_CHANGING_ACTIONS:
-        request_backup(action)
-
-
-DATA_CHANGING_ACTIONS = {
-    "expense_created", "expense_edited", "expense_deleted", "expense_restored", "expense_purged",
-    "category_created", "category_updated", "category_archived", "category_restored",
-    "user_created", "user_updated", "password_changed", "backup_restored",
-}
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "unknown")
 
 
 def has_permission(user, perm):
@@ -392,49 +271,59 @@ def has_permission(user, perm):
 def validate_password(password):
     if not password or len(password) < 8:
         return "Password must be at least 8 characters."
-    if not re.search(r"[A-Z]", password):
-        return "Password must contain an uppercase letter."
-    if not re.search(r"[a-z]", password):
-        return "Password must contain a lowercase letter."
-    if not re.search(r"[0-9]", password):
-        return "Password must contain a number."
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"[0-9]", password):
+        return "Password needs an uppercase letter, a lowercase letter and a number."
     return None
 
 
+def user_display(user):
+    return user.get("full_name") or user.get("username")
+
+
+DATA_CHANGING_ACTIONS = {
+    "expense_created", "expense_edited", "expense_deleted", "expense_restored", "expense_purged",
+    "category_created", "category_updated", "category_archived", "category_restored",
+    "project_created", "project_updated", "partners_updated", "fields_updated",
+    "user_created", "user_updated", "password_changed", "backup_restored",
+}
+LOGIN_ACTIONS = ["login", "login_failed", "logout", "password_changed", "permission_denied"]
+
+
+def record_audit(action, entity_type, entity_id, details=None, user=None, project_id=None):
+    user = user or getattr(g, "user", None)
+    audit_col.insert_one({
+        "action": action, "entity_type": entity_type, "entity_id": str(entity_id) if entity_id is not None else None,
+        "project_id": project_id or getattr(g, "project_id", None),
+        "user_id": str(user["_id"]) if user else None, "user_name": user_display(user) if user else "system",
+        "at": utcnow(), "ip": client_ip() if request else None, "details": details or {},
+    })
+    if action in DATA_CHANGING_ACTIONS:
+        request_backup(action)
+
+
 # ---------------------------------------------------------------------------
-# Authentication and authorization
+# Auth
 # ---------------------------------------------------------------------------
 
 def current_user():
-    user_id = session.get("user_id")
-    if not user_id:
-        return None
-    oid = to_oid(user_id)
+    oid = to_oid(session.get("user_id"))
     if not oid:
         return None
     user = users_col.find_one({"_id": oid})
-    if not user or not user.get("active", False):
-        return None
-    if user.get("session_version", 1) != session.get("session_version"):
+    if not user or not user.get("active", False) or user.get("session_version", 1) != session.get("session_version"):
         return None
     return user
-
-
-def session_expired():
-    last = session.get("last_active")
-    if not last:
-        return True
-    idle = utcnow() - datetime.fromisoformat(last)
-    return idle > timedelta(minutes=CONFIG["SESSION_IDLE_MINUTES"])
 
 
 @app.before_request
 def load_user():
     g.user = None
+    g.project_id = None
     if request.path.startswith("/static/"):
         return None
     if session.get("user_id"):
-        if session_expired():
+        last = session.get("last_active")
+        if not last or utcnow() - datetime.fromisoformat(last) > timedelta(minutes=CONFIG["SESSION_IDLE_MINUTES"]):
             session.clear()
         else:
             g.user = current_user()
@@ -442,12 +331,11 @@ def load_user():
                 session["last_active"] = utcnow().isoformat()
             else:
                 session.clear()
-    # CSRF protection for every state-changing API call
-    if request.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        if request.path != "/api/auth/login":
-            token = request.headers.get("X-CSRF-Token", "")
-            if not token or not session.get("csrf_token") or not secrets.compare_digest(token, session["csrf_token"]):
-                return json_error("Invalid or missing CSRF token. Reload the page and try again.", 403)
+    g.project_id = request.headers.get("X-Project-Id") or request.args.get("project_id") or None
+    if request.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path != "/api/auth/login":
+        token = request.headers.get("X-CSRF-Token", "")
+        if not token or not session.get("csrf_token") or not secrets.compare_digest(token, session["csrf_token"]):
+            return json_error("Invalid or missing CSRF token. Reload the page and try again.", 403)
     return None
 
 
@@ -456,11 +344,8 @@ def security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
-        "font-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'"
-    )
+    response.headers["Content-Security-Policy"] = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                                                   "script-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'")
     if CONFIG["SECURE_COOKIES"]:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.path.startswith("/api/"):
@@ -498,43 +383,261 @@ def _attempt_key(username):
 
 def login_locked(username):
     with _login_lock:
-        entry = _login_attempts.get(_attempt_key(username))
-        if entry and entry.get("locked_until") and entry["locked_until"] > utcnow():
-            return int((entry["locked_until"] - utcnow()).total_seconds() // 60) + 1
+        e = _login_attempts.get(_attempt_key(username))
+        if e and e.get("locked_until") and e["locked_until"] > utcnow():
+            return int((e["locked_until"] - utcnow()).total_seconds() // 60) + 1
     return 0
 
 
 def register_failed_login(username):
     with _login_lock:
-        key = _attempt_key(username)
-        entry = _login_attempts.setdefault(key, {"count": 0, "locked_until": None})
-        entry["count"] += 1
-        if entry["count"] >= CONFIG["MAX_LOGIN_ATTEMPTS"]:
-            entry["locked_until"] = utcnow() + timedelta(minutes=CONFIG["LOCKOUT_MINUTES"])
-            entry["count"] = 0
-
-
-def clear_failed_logins(username):
-    with _login_lock:
-        _login_attempts.pop(_attempt_key(username), None)
+        e = _login_attempts.setdefault(_attempt_key(username), {"count": 0, "locked_until": None})
+        e["count"] += 1
+        if e["count"] >= CONFIG["MAX_LOGIN_ATTEMPTS"]:
+            e["locked_until"] = utcnow() + timedelta(minutes=CONFIG["LOCKOUT_MINUTES"])
+            e["count"] = 0
 
 
 def public_user(user):
-    return {
-        "id": str(user["_id"]),
-        "username": user["username"],
-        "full_name": user.get("full_name", ""),
-        "role": user.get("role"),
-        "active": user.get("active", True),
-        "must_change_password": user.get("must_change_password", False),
-        "permissions": sorted(ROLE_PERMISSIONS.get(user.get("role"), set())),
-        "last_login_at": serialize(user.get("last_login_at")),
-        "created_at": serialize(user.get("created_at")),
-    }
+    return {"id": str(user["_id"]), "username": user["username"], "full_name": user.get("full_name", ""), "role": user.get("role"),
+            "active": user.get("active", True), "must_change_password": user.get("must_change_password", False),
+            "permissions": sorted(ROLE_PERMISSIONS.get(user.get("role"), set())),
+            "last_login_at": serialize(user.get("last_login_at")), "created_at": serialize(user.get("created_at"))}
 
 
 # ---------------------------------------------------------------------------
-# Page routes
+# Projects and partners
+# ---------------------------------------------------------------------------
+
+def project_public(p):
+    d = serialize(p)
+    d["partner_count"] = len([x for x in p.get("partners", []) if x.get("active", True)])
+    return d
+
+
+def get_project_or_none(project_id=None):
+    pid = project_id or g.project_id
+    oid = to_oid(pid)
+    return projects_col.find_one({"_id": oid}) if oid else None
+
+
+def require_project(fn):
+    """Loads the project named by the X-Project-Id header / project_id param into g.project."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        proj = get_project_or_none()
+        if not proj:
+            return json_error("Choose a project first.", 400, code="no_project")
+        g.project = proj
+        g.project_id = str(proj["_id"])
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def validate_partners(raw, existing=None):
+    """Return (partners, error). Shares must add up to 100. Existing partner ids are kept."""
+    if not isinstance(raw, list) or not raw:
+        return None, "Add at least one partner."
+    existing_by_id = {p["id"]: p for p in (existing or [])}
+    out, total, names = [], 0.0, set()
+    for item in raw:
+        name = clean_str(item.get("name"), 80)
+        if len(name) < 1:
+            return None, "Every partner needs a name."
+        if name.lower() in names:
+            return None, f"Partner name '{name}' is used twice."
+        names.add(name.lower())
+        share = parse_amount(item.get("share"), allow_zero=True)
+        if share is None or share > 100:
+            return None, f"Enter a valid percentage for {name}."
+        pid = item.get("id") if item.get("id") in existing_by_id else uuid.uuid4().hex[:10]
+        out.append({"id": pid, "name": name, "phone": clean_str(item.get("phone"), 30), "share": share,
+                    "active": bool(item.get("active", True)),
+                    "added_at": existing_by_id.get(pid, {}).get("added_at", utcnow())})
+        if out[-1]["active"]:
+            total += share
+    if abs(total - 100) > 0.01:
+        return None, f"Shares of active partners must add up to 100% (currently {total:g}%)."
+    return out, None
+
+
+def seed_categories_for_project(project_id, categories=None):
+    order = 0
+    for parent_name, children in (categories or seed_data.DEFAULT_CATEGORIES).items():
+        order += 1
+        parent = {"project_id": project_id, "name": parent_name, "parent_id": None, "path": [parent_name], "path_ids": [], "level": 0,
+                  "description": "", "status": "active", "sort_order": order, "created_at": utcnow(), "is_default": True}
+        pid = categories_col.insert_one(parent).inserted_id
+        categories_col.update_one({"_id": pid}, {"$set": {"path_ids": [str(pid)]}})
+        for i, child_name in enumerate(children):
+            child = {"project_id": project_id, "name": child_name, "parent_id": str(pid), "path": [parent_name, child_name],
+                     "path_ids": [str(pid)], "level": 1, "description": "", "status": "active", "sort_order": i + 1,
+                     "created_at": utcnow(), "is_default": True}
+            cid = categories_col.insert_one(child).inserted_id
+            categories_col.update_one({"_id": cid}, {"$set": {"path_ids": [str(pid), str(cid)]}})
+
+
+def create_project(name, description, partners, created_by=None):
+    doc = {"name": name, "description": description, "status": "active", "partners": partners,
+           "field_config": json.loads(json.dumps(DEFAULT_FIELD_CONFIG)), "custom_fields": [],
+           "created_at": utcnow(), "created_by": created_by}
+    pid = projects_col.insert_one(doc).inserted_id
+    seed_categories_for_project(str(pid))
+    doc["_id"] = pid
+    return doc
+
+
+@app.route("/api/projects")
+@login_required
+def api_projects_list():
+    projs = list(projects_col.find({}).sort("created_at", ASCENDING))
+    counts = {r["_id"]: r for r in expenses_col.aggregate([{"$match": {"status": "active"}},
+                                                           {"$group": {"_id": "$project_id", "count": {"$sum": 1}, "total": {"$sum": "$amount"}}}])}
+    out = []
+    for p in projs:
+        d = project_public(p)
+        c = counts.get(str(p["_id"]), {"count": 0, "total": 0})
+        d["expense_count"], d["expense_total"] = c["count"], round(c["total"], 2)
+        out.append(d)
+    return jsonify({"projects": out, "firm_name": CONFIG["FIRM_NAME"]})
+
+
+@app.route("/api/projects", methods=["POST"])
+@require("project:manage")
+def api_projects_create():
+    data = request.get_json(silent=True) or {}
+    name = clean_str(data.get("name"), 80)
+    if len(name) < 2:
+        return json_error("Project name must be at least 2 characters.")
+    if projects_col.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+        return json_error("A project with this name already exists.", 409)
+    partners, err = validate_partners(data.get("partners") or [])
+    if err:
+        return json_error(err)
+    proj = create_project(name, clean_str(data.get("description"), 300), partners, str(g.user["_id"]))
+    record_audit("project_created", "project", proj["_id"], {"name": name, "partners": [(p["name"], p["share"]) for p in partners]},
+                 project_id=str(proj["_id"]))
+    return jsonify({"project": project_public(proj)}), 201
+
+
+@app.route("/api/projects/<project_id>", methods=["PUT"])
+@require("project:manage")
+def api_projects_update(project_id):
+    proj = get_project_or_none(project_id)
+    if not proj:
+        return json_error("Project not found.", 404)
+    data = request.get_json(silent=True) or {}
+    updates, details = {}, {}
+    if "name" in data:
+        name = clean_str(data["name"], 80)
+        if len(name) < 2:
+            return json_error("Project name must be at least 2 characters.")
+        updates["name"], details["name"] = name, name
+    if "description" in data:
+        updates["description"] = clean_str(data["description"], 300)
+    if "status" in data and data["status"] in ("active", "archived"):
+        updates["status"], details["status"] = data["status"], data["status"]
+    action = "project_updated"
+    if "partners" in data:
+        partners, err = validate_partners(data["partners"], proj.get("partners", []))
+        if err:
+            return json_error(err)
+        # A partner who has already paid for something cannot be removed, only made inactive.
+        kept = {p["id"] for p in partners}
+        for old in proj.get("partners", []):
+            if old["id"] not in kept and expenses_col.count_documents({"payments.partner_id": old["id"]}):
+                return json_error(f"{old['name']} has payments recorded. Untick 'active' instead of removing them.", 409)
+        updates["partners"] = partners
+        details["partners"] = [{"name": p["name"], "share": p["share"], "active": p["active"]} for p in partners]
+        action = "partners_updated"
+    if "field_config" in data:
+        cfg = {}
+        for key, _label in OPTIONAL_FIELDS:
+            item = (data["field_config"] or {}).get(key) or {}
+            cfg[key] = {"enabled": bool(item.get("enabled")), "required": bool(item.get("enabled")) and bool(item.get("required"))}
+        updates["field_config"] = cfg
+        details["field_config"] = {k: v for k, v in cfg.items() if v["enabled"]}
+        action = "fields_updated"
+    if "custom_fields" in data:
+        fields, seen = [], set()
+        for item in data["custom_fields"] or []:
+            label = clean_str(item.get("label"), 60)
+            if len(label) < 1:
+                return json_error("Every custom field needs a label.")
+            key = item.get("key") if re.fullmatch(r"cf_[a-z0-9]{6,12}", str(item.get("key") or "")) else "cf_" + uuid.uuid4().hex[:8]
+            if key in seen:
+                continue
+            seen.add(key)
+            ftype = item.get("type") if item.get("type") in CUSTOM_FIELD_TYPES else "text"
+            options = [clean_str(o, 60) for o in (item.get("options") or []) if clean_str(o, 60)] if ftype == "select" else []
+            if ftype == "select" and not options:
+                return json_error(f"Dropdown field '{label}' needs at least one option.")
+            fields.append({"key": key, "label": label, "type": ftype, "required": bool(item.get("required")), "options": options})
+        updates["custom_fields"] = fields
+        details["custom_fields"] = [f["label"] for f in fields]
+        action = "fields_updated"
+    if not updates:
+        return json_error("Nothing to update.")
+    projects_col.update_one({"_id": proj["_id"]}, {"$set": dict(updates, updated_at=utcnow())})
+    record_audit(action, "project", proj["_id"], details, project_id=str(proj["_id"]))
+    return jsonify({"project": project_public(projects_col.find_one({"_id": proj["_id"]}))})
+
+
+# ---------------------------------------------------------------------------
+# Seed
+# ---------------------------------------------------------------------------
+
+def seed_defaults():
+    if users_col.count_documents({}) == 0:
+        a = CONFIG["DEFAULT_ADMIN"]
+        users_col.insert_one({"username": a["username"], "full_name": a["full_name"], "password_hash": generate_password_hash(a["password"]),
+                              "role": "admin", "active": True, "must_change_password": True, "session_version": 1,
+                              "created_at": utcnow(), "last_login_at": None})
+        log.info("Created default admin user '%s'", a["username"])
+    if projects_col.count_documents({}) == 0 and CONFIG["IMPORT_SEED_LEDGER"]:
+        import_seed_ledger()
+
+
+def import_seed_ledger():
+    """Create the Restaurant project and import the partners' ledger from seed_data.py."""
+    sp = seed_data.PROJECT
+    partners = [{"id": uuid.uuid4().hex[:10], "name": p["name"], "phone": p.get("phone", ""), "share": float(p["share"]),
+                 "active": True, "added_at": utcnow()} for p in sp["partners"]]
+    proj = create_project(sp["name"], sp.get("description", ""), partners)
+    pid = str(proj["_id"])
+    by_name = {p["name"]: p for p in partners}
+    cats = {tuple(c["path"]): c for c in categories_col.find({"project_id": pid})}
+    now = utcnow()
+    total = 0
+    for i, (desc, date, amount, paid_a, paid_v) in enumerate(seed_data.ROWS, start=1):
+        cat_name, sub_name = seed_data.guess_category(desc)
+        top = cats.get((cat_name,))
+        sub = cats.get((cat_name, sub_name)) if sub_name else None
+        payments = []
+        for pname, paid in (("Advith", paid_a), ("Vibhav", paid_v)):
+            if paid:
+                payments.append({"partner_id": by_name[pname]["id"], "partner_name": pname, "amount": float(paid)})
+        d = parse_date(date)
+        doc = {"expense_id": f"EXP-2026-{i:05d}", "project_id": pid, "description": desc, "amount": float(amount), "transaction_date": d,
+               "category_id": str(top["_id"]), "subcategory_id": str(sub["_id"]) if sub else None,
+               "category_path": sub["path"] if sub else top["path"], "payments": payments, "vendor": "", "payment_method": "",
+               "payment_reference": "", "payment_status": "Paid", "notes": "Imported from the partners' Google Sheet ledger",
+               "receipt_reference": "", "expense_type": "Setup", "project_phase": "", "custom": {}, "status": "active", "revision": 1,
+               "created_by": "import", "created_by_name": "Ledger import", "created_at": now, "updated_at": now,
+               "deleted_by": None, "deleted_at": None, "deletion_reason": None, "restoration_history": []}
+        expenses_col.insert_one(doc)
+        revisions_col.insert_one({"expense_oid": doc["_id"], "expense_id": doc["expense_id"], "revision": 1, "action": "create", "changes": {},
+                                  "snapshot_before": None, "snapshot_after": snapshot(doc), "user_id": "import", "user_name": "Ledger import",
+                                  "at": now, "reason": "Imported from Google Sheet"})
+        total += amount
+    counters_col.update_one({"_id": "expense_2026"}, {"$set": {"seq": len(seed_data.ROWS)}}, upsert=True)
+    audit_col.insert_one({"action": "ledger_imported", "entity_type": "project", "entity_id": pid, "project_id": pid, "user_id": None,
+                          "user_name": "system", "at": now, "ip": None, "details": {"rows": len(seed_data.ROWS), "total": total}})
+    log.info("Imported %d ledger rows (total %s) into project '%s'", len(seed_data.ROWS), total, sp["name"])
+
+
+# ---------------------------------------------------------------------------
+# Pages
 # ---------------------------------------------------------------------------
 
 @app.route("/login")
@@ -543,26 +646,18 @@ def login_page():
         return redirect(url_for("index"))
     if not session.get("csrf_token"):
         session["csrf_token"] = secrets.token_urlsafe(32)
-    return render_template("login.html", csrf_token=session["csrf_token"])
+    return render_template("login.html", csrf_token=session["csrf_token"], firm_name=CONFIG["FIRM_NAME"])
 
 
 @app.route("/")
 @login_required
 def index():
-    return render_template(
-        "index.html",
-        csrf_token=session["csrf_token"],
-        user_json=json.dumps(public_user(g.user)).replace("</", "<\\/"),
-        meta_json=json.dumps({
-            "payment_methods": PAYMENT_METHODS,
-            "payment_statuses": PAYMENT_STATUSES,
-            "expense_types": EXPENSE_TYPES,
-            "roles": ROLES,
-            "widgets": DASHBOARD_WIDGETS,
-            "currency": CONFIG["CURRENCY"],
-            "idle_minutes": CONFIG["SESSION_IDLE_MINUTES"],
-        }).replace("</", "<\\/"),
-    )
+    meta = {"payment_methods": PAYMENT_METHODS, "payment_statuses": PAYMENT_STATUSES, "expense_types": EXPENSE_TYPES, "roles": ROLES,
+            "widgets": DASHBOARD_WIDGETS, "currency": CONFIG["CURRENCY"], "idle_minutes": CONFIG["SESSION_IDLE_MINUTES"],
+            "optional_fields": OPTIONAL_FIELDS, "custom_field_types": CUSTOM_FIELD_TYPES, "firm_name": CONFIG["FIRM_NAME"]}
+    return render_template("index.html", csrf_token=session["csrf_token"], firm_name=CONFIG["FIRM_NAME"],
+                           user_json=json.dumps(public_user(g.user)).replace("</", "<\\/"),
+                           meta_json=json.dumps(meta).replace("</", "<\\/"))
 
 
 @app.route("/logout")
@@ -580,38 +675,33 @@ def logout_page():
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
-    username = clean_str(data.get("username"), 64)
-    password = data.get("password") or ""
+    username, password = clean_str(data.get("username"), 64), data.get("password") or ""
     token = request.headers.get("X-CSRF-Token", "")
     if not username or not password:
         return json_error("Enter your username and password.")
     if not session.get("csrf_token") or not secrets.compare_digest(token, session.get("csrf_token", "")):
         return json_error("Session expired. Reload the page and sign in again.", 403)
-
     minutes = login_locked(username)
     if minutes:
         return json_error(f"Too many failed attempts. Try again in {minutes} minute(s).", 429)
-
     user = users_col.find_one({"username": username.lower()})
     if not user or not check_password_hash(user["password_hash"], password):
         register_failed_login(username)
         record_audit("login_failed", "user", username, {"reason": "bad_credentials"}, user=None)
-        time.sleep(0.4)  # slow down brute force attempts
+        time.sleep(0.4)
         return json_error("Incorrect username or password.", 401)
     if not user.get("active", False):
         record_audit("login_failed", "user", str(user["_id"]), {"reason": "inactive"}, user=None)
-        return json_error("This account is disabled. Contact an administrator.", 403)
-
-    clear_failed_logins(username)
+        return json_error("This account is disabled. Contact the administrator.", 403)
+    with _login_lock:
+        _login_attempts.pop(_attempt_key(username), None)
     session.clear()
     session.permanent = True
-    session["user_id"] = str(user["_id"])
-    session["session_version"] = user.get("session_version", 1)
-    session["csrf_token"] = secrets.token_urlsafe(32)
-    session["last_active"] = utcnow().isoformat()
+    session.update({"user_id": str(user["_id"]), "session_version": user.get("session_version", 1),
+                    "csrf_token": secrets.token_urlsafe(32), "last_active": utcnow().isoformat()})
     users_col.update_one({"_id": user["_id"]}, {"$set": {"last_login_at": utcnow()}})
     g.user = user
-    record_audit("login", "user", user["_id"])
+    record_audit("login", "user", user["_id"], {"user_agent": request.headers.get("User-Agent", "")[:120]})
     return jsonify({"user": public_user(user), "csrf_token": session["csrf_token"]})
 
 
@@ -633,11 +723,9 @@ def api_me():
 @login_required
 def api_change_password():
     data = request.get_json(silent=True) or {}
-    current = data.get("current_password") or ""
-    new = data.get("new_password") or ""
-    confirm = data.get("confirm_password") or ""
+    current, new, confirm = data.get("current_password") or "", data.get("new_password") or "", data.get("confirm_password") or ""
     if not check_password_hash(g.user["password_hash"], current):
-        return json_error("Current password is incorrect.", 400)
+        return json_error("Current password is incorrect.")
     if new != confirm:
         return json_error("New password and confirmation do not match.")
     if new == current:
@@ -645,22 +733,19 @@ def api_change_password():
     problem = validate_password(new)
     if problem:
         return json_error(problem)
-    users_col.update_one({"_id": g.user["_id"]}, {
-        "$set": {"password_hash": generate_password_hash(new), "must_change_password": False},
-    })
+    users_col.update_one({"_id": g.user["_id"]}, {"$set": {"password_hash": generate_password_hash(new), "must_change_password": False}})
     record_audit("password_changed", "user", g.user["_id"])
     return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
-# User management API (admin)
+# Users (admin)
 # ---------------------------------------------------------------------------
 
 @app.route("/api/users")
 @require("user:manage")
 def api_users_list():
-    users = list(users_col.find({}).sort("username", ASCENDING))
-    return jsonify({"users": [public_user(u) for u in users]})
+    return jsonify({"users": [public_user(u) for u in users_col.find({}).sort("username", ASCENDING)]})
 
 
 @app.route("/api/users", methods=["POST"])
@@ -668,27 +753,22 @@ def api_users_list():
 def api_users_create():
     data = request.get_json(silent=True) or {}
     username = clean_str(data.get("username"), 64).lower()
-    full_name = clean_str(data.get("full_name"), 120)
-    role = data.get("role")
-    password = data.get("password") or ""
+    role, password = data.get("role"), data.get("password") or ""
     if not re.fullmatch(r"[a-z0-9._-]{3,64}", username):
         return json_error("Username must be 3-64 characters: letters, numbers, dot, dash or underscore.")
-    if role not in ROLES:
-        return json_error("Choose a valid role.")
+    if role not in ("editor", "viewer"):
+        return json_error("Role must be editor or viewer. There is only one admin account.")
     problem = validate_password(password)
     if problem:
         return json_error(problem)
-    doc = {
-        "username": username, "full_name": full_name or username, "role": role,
-        "password_hash": generate_password_hash(password), "active": True,
-        "must_change_password": True, "session_version": 1, "created_at": utcnow(), "last_login_at": None,
-    }
+    doc = {"username": username, "full_name": clean_str(data.get("full_name"), 120) or username, "role": role,
+           "password_hash": generate_password_hash(password), "active": True, "must_change_password": True, "session_version": 1,
+           "created_at": utcnow(), "last_login_at": None}
     try:
-        result = users_col.insert_one(doc)
+        doc["_id"] = users_col.insert_one(doc).inserted_id
     except DuplicateKeyError:
         return json_error("That username is already taken.", 409)
-    doc["_id"] = result.inserted_id
-    record_audit("user_created", "user", result.inserted_id, {"username": username, "role": role})
+    record_audit("user_created", "user", doc["_id"], {"username": username, "role": role})
     return jsonify({"user": public_user(doc)}), 201
 
 
@@ -700,23 +780,17 @@ def api_users_update(user_id):
     if not user:
         return json_error("User not found.", 404)
     data = request.get_json(silent=True) or {}
-    updates = {}
-    changes = {}
+    updates, changes = {}, {}
     if "full_name" in data:
         updates["full_name"] = clean_str(data["full_name"], 120) or user["username"]
-    if "role" in data:
-        if data["role"] not in ROLES:
-            return json_error("Choose a valid role.")
-        if user["_id"] == g.user["_id"] and data["role"] != "admin":
-            return json_error("You cannot remove your own admin role.")
+    if "role" in data and user["role"] != "admin":
+        if data["role"] not in ("editor", "viewer"):
+            return json_error("Role must be editor or viewer.")
         updates["role"] = data["role"]
     if "active" in data:
-        active = bool(data["active"])
-        if user["_id"] == g.user["_id"] and not active:
+        if user["_id"] == g.user["_id"]:
             return json_error("You cannot disable your own account.")
-        if not active and user.get("role") == "admin" and users_col.count_documents({"role": "admin", "active": True}) <= 1:
-            return json_error("At least one active admin is required.")
-        updates["active"] = active
+        updates["active"] = bool(data["active"])
     if data.get("new_password"):
         problem = validate_password(data["new_password"])
         if problem:
@@ -726,7 +800,6 @@ def api_users_update(user_id):
         changes["password_reset"] = True
     if not updates:
         return json_error("Nothing to update.")
-    # Force re-login when role, status or password changes.
     if any(k in updates for k in ("role", "active", "password_hash")) and user["_id"] != g.user["_id"]:
         updates["session_version"] = user.get("session_version", 1) + 1
     users_col.update_one({"_id": oid}, {"$set": updates})
@@ -736,24 +809,19 @@ def api_users_update(user_id):
 
 
 # ---------------------------------------------------------------------------
-# Categories API
+# Categories (per project)
 # ---------------------------------------------------------------------------
 
-def category_tree(include_archived=False):
-    query = {} if include_archived else {"status": "active"}
+def category_tree(project_id, include_archived=False):
+    query = {"project_id": project_id}
+    if not include_archived:
+        query["status"] = "active"
     cats = list(categories_col.find(query).sort([("level", ASCENDING), ("sort_order", ASCENDING), ("name", ASCENDING)]))
     usage = {}
-    for row in expenses_col.aggregate([
-        {"$match": {"status": "active"}},
-        {"$group": {"_id": "$category_id", "count": {"$sum": 1}, "total": {"$sum": "$amount"}}},
-    ]):
-        usage[row["_id"]] = {"count": row["count"], "total": round(row["total"], 2)}
-    for row in expenses_col.aggregate([
-        {"$match": {"status": "active", "subcategory_id": {"$ne": None}}},
-        {"$group": {"_id": "$subcategory_id", "count": {"$sum": 1}, "total": {"$sum": "$amount"}}},
-    ]):
-        existing = usage.get(row["_id"], {"count": 0, "total": 0})
-        usage[row["_id"]] = {"count": existing["count"] + row["count"], "total": round(existing["total"] + row["total"], 2)}
+    for field in ("category_id", "subcategory_id"):
+        for row in expenses_col.aggregate([{"$match": {"project_id": project_id, "status": "active", field: {"$ne": None}}},
+                                           {"$group": {"_id": f"${field}", "count": {"$sum": 1}, "total": {"$sum": "$amount"}}}]):
+            usage[row["_id"]] = {"count": row["count"], "total": round(row["total"], 2)}
     flat = []
     for c in cats:
         item = serialize(c)
@@ -764,70 +832,60 @@ def category_tree(include_archived=False):
     for c in flat:
         node = by_id[c["id"]]
         parent = by_id.get(c["parent_id"]) if c["parent_id"] else None
-        if parent:
-            parent["children"].append(node)
-        else:
-            roots.append(node)
+        (parent["children"] if parent else roots).append(node)
     return roots, flat
 
 
 @app.route("/api/categories")
 @require("category:view")
+@require_project
 def api_categories():
-    include_archived = request.args.get("include_archived") == "1"
-    tree, flat = category_tree(include_archived)
+    tree, flat = category_tree(g.project_id, request.args.get("include_archived") == "1")
     return jsonify({"tree": tree, "flat": flat})
 
 
 @app.route("/api/categories", methods=["POST"])
 @require("category:manage")
+@require_project
 def api_categories_create():
     data = request.get_json(silent=True) or {}
     name = clean_str(data.get("name"), 80)
-    description = clean_str(data.get("description"), 300)
     parent_id = data.get("parent_id") or None
     if len(name) < 2:
         return json_error("Category name must be at least 2 characters.")
     parent = None
     if parent_id:
-        parent = categories_col.find_one({"_id": to_oid(parent_id)}) if to_oid(parent_id) else None
-        if not parent:
-            return json_error("Parent category not found.", 404)
-        if parent.get("status") != "active":
-            return json_error("Cannot add under an archived category.")
-    if categories_col.find_one({"parent_id": parent_id, "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+        parent = categories_col.find_one({"_id": to_oid(parent_id), "project_id": g.project_id}) if to_oid(parent_id) else None
+        if not parent or parent.get("status") != "active":
+            return json_error("Parent category not found or archived.", 404)
+    if categories_col.find_one({"project_id": g.project_id, "parent_id": parent_id, "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
         return json_error("A category with this name already exists at this level.", 409)
     path = (parent["path"] if parent else []) + [name]
-    sort_order = categories_col.count_documents({"parent_id": parent_id}) + 1
-    doc = {
-        "name": name, "parent_id": parent_id, "path": path, "path_ids": [], "level": len(path) - 1,
-        "description": description, "status": "active", "sort_order": sort_order, "created_at": utcnow(),
-        "created_by": str(g.user["_id"]), "is_default": False,
-    }
+    doc = {"project_id": g.project_id, "name": name, "parent_id": parent_id, "path": path, "path_ids": [], "level": len(path) - 1,
+           "description": clean_str(data.get("description"), 300), "status": "active",
+           "sort_order": categories_col.count_documents({"project_id": g.project_id, "parent_id": parent_id}) + 1,
+           "created_at": utcnow(), "created_by": str(g.user["_id"]), "is_default": False}
     cid = categories_col.insert_one(doc).inserted_id
-    path_ids = (parent["path_ids"] if parent else []) + [str(cid)]
-    categories_col.update_one({"_id": cid}, {"$set": {"path_ids": path_ids}})
+    categories_col.update_one({"_id": cid}, {"$set": {"path_ids": (parent["path_ids"] if parent else []) + [str(cid)]}})
     record_audit("category_created", "category", cid, {"name": name, "path": path})
     return jsonify({"category": serialize(categories_col.find_one({"_id": cid}))}), 201
 
 
 def rename_descendant_paths(cat):
-    """Rebuild path arrays for a renamed category and everything below it."""
     cid = str(cat["_id"])
-    descendants = categories_col.find({"path_ids": cid, "_id": {"$ne": cat["_id"]}})
-    for d in descendants:
+    for d in categories_col.find({"path_ids": cid, "_id": {"$ne": cat["_id"]}}):
         idx = d["path_ids"].index(cid)
         new_path = cat["path"] + d["path"][idx + 1:]
         categories_col.update_one({"_id": d["_id"]}, {"$set": {"path": new_path}})
-        expenses_col.update_many({"$or": [{"category_id": str(d["_id"])}, {"subcategory_id": str(d["_id"])}]},
-                                 {"$set": {"category_path": new_path}})
+        expenses_col.update_many({"$or": [{"category_id": str(d["_id"])}, {"subcategory_id": str(d["_id"])}]}, {"$set": {"category_path": new_path}})
 
 
 @app.route("/api/categories/<cat_id>", methods=["PUT"])
 @require("category:manage")
+@require_project
 def api_categories_update(cat_id):
     oid = to_oid(cat_id)
-    cat = categories_col.find_one({"_id": oid}) if oid else None
+    cat = categories_col.find_one({"_id": oid, "project_id": g.project_id}) if oid else None
     if not cat:
         return json_error("Category not found.", 404)
     data = request.get_json(silent=True) or {}
@@ -836,66 +894,66 @@ def api_categories_update(cat_id):
         name = clean_str(data["name"], 80)
         if len(name) < 2:
             return json_error("Category name must be at least 2 characters.")
-        dup = categories_col.find_one({"parent_id": cat["parent_id"], "_id": {"$ne": oid},
-                                       "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
-        if dup:
+        if categories_col.find_one({"project_id": g.project_id, "parent_id": cat["parent_id"], "_id": {"$ne": oid},
+                                    "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
             return json_error("A category with this name already exists at this level.", 409)
-        updates["name"] = name
-        updates["path"] = cat["path"][:-1] + [name]
+        updates["name"], updates["path"] = name, cat["path"][:-1] + [name]
     if "description" in data:
         updates["description"] = clean_str(data["description"], 300)
-    if "sort_order" in data:
-        try:
-            updates["sort_order"] = int(data["sort_order"])
-        except (TypeError, ValueError):
-            pass
     if not updates:
         return json_error("Nothing to update.")
     categories_col.update_one({"_id": oid}, {"$set": updates})
     cat = categories_col.find_one({"_id": oid})
     if "name" in updates:
-        expenses_col.update_many({"$or": [{"category_id": cat_id}, {"subcategory_id": cat_id}]},
-                                 {"$set": {"category_path": cat["path"]}})
+        expenses_col.update_many({"$or": [{"category_id": cat_id}, {"subcategory_id": cat_id}]}, {"$set": {"category_path": cat["path"]}})
         rename_descendant_paths(cat)
     record_audit("category_updated", "category", oid, updates)
     return jsonify({"category": serialize(cat)})
 
 
+def resolve_category_pair(selected_id):
+    cat = categories_col.find_one({"_id": to_oid(selected_id)}) if to_oid(selected_id) else None
+    if not cat:
+        return None, None
+    return cat["path_ids"][0], (selected_id if cat["level"] > 0 else None)
+
+
 @app.route("/api/categories/<cat_id>/archive", methods=["POST"])
 @require("category:manage")
+@require_project
 def api_categories_archive(cat_id):
     oid = to_oid(cat_id)
-    cat = categories_col.find_one({"_id": oid}) if oid else None
+    cat = categories_col.find_one({"_id": oid, "project_id": g.project_id}) if oid else None
     if not cat:
         return json_error("Category not found.", 404)
     data = request.get_json(silent=True) or {}
     ids = [str(c["_id"]) for c in categories_col.find({"path_ids": cat_id})]
-    in_use = expenses_col.count_documents({"status": "active", "$or": [{"category_id": {"$in": ids}}, {"subcategory_id": {"$in": ids}}]})
+    using = {"status": "active", "$or": [{"category_id": {"$in": ids}}, {"subcategory_id": {"$in": ids}}]}
+    in_use = expenses_col.count_documents(using)
     reassign_to = data.get("reassign_to")
     if in_use and not reassign_to:
         return json_error(f"{in_use} active expense(s) use this category. Choose a category to move them to first.", 409, in_use=in_use)
     moved = 0
-    if in_use and reassign_to:
-        target = categories_col.find_one({"_id": to_oid(reassign_to), "status": "active"}) if to_oid(reassign_to) else None
+    if in_use:
+        target = categories_col.find_one({"_id": to_oid(reassign_to), "status": "active", "project_id": g.project_id}) if to_oid(reassign_to) else None
         if not target or str(target["_id"]) in ids:
             return json_error("Choose a valid, active category to move expenses to.")
-        if not has_permission(g.user, "expense:edit"):
-            return json_error("You need expense edit permission to reassign expenses.", 403)
         new_cat, new_sub = resolve_category_pair(str(target["_id"]))
-        for exp in expenses_col.find({"status": "active", "$or": [{"category_id": {"$in": ids}}, {"subcategory_id": {"$in": ids}}]}):
+        for exp in expenses_col.find(using):
             apply_edit(exp, {"category_id": new_cat, "subcategory_id": new_sub, "category_path": target["path"]},
                        reason=f"Category '{cat['name']}' archived; moved to '{' > '.join(target['path'])}'")
             moved += 1
     categories_col.update_many({"_id": {"$in": [ObjectId(i) for i in ids]}}, {"$set": {"status": "archived", "archived_at": utcnow()}})
-    record_audit("category_archived", "category", oid, {"name": cat["name"], "reassigned": moved, "reassign_to": reassign_to})
+    record_audit("category_archived", "category", oid, {"name": cat["name"], "reassigned": moved})
     return jsonify({"ok": True, "reassigned": moved})
 
 
 @app.route("/api/categories/<cat_id>/unarchive", methods=["POST"])
 @require("category:manage")
+@require_project
 def api_categories_unarchive(cat_id):
     oid = to_oid(cat_id)
-    cat = categories_col.find_one({"_id": oid}) if oid else None
+    cat = categories_col.find_one({"_id": oid, "project_id": g.project_id}) if oid else None
     if not cat:
         return json_error("Category not found.", 404)
     if cat["parent_id"]:
@@ -907,129 +965,150 @@ def api_categories_unarchive(cat_id):
     return jsonify({"ok": True})
 
 
-def resolve_category_pair(selected_id):
-    """Given any category node, return (top-level category id, leaf id or None)."""
-    cat = categories_col.find_one({"_id": to_oid(selected_id)}) if to_oid(selected_id) else None
-    if not cat:
-        return None, None
-    top = cat["path_ids"][0]
-    sub = selected_id if cat["level"] > 0 else None
-    return top, sub
-
-
 # ---------------------------------------------------------------------------
-# Expenses API
+# Expenses
 # ---------------------------------------------------------------------------
 
-EDITABLE_FIELDS = [
-    "description", "amount", "transaction_date", "category_id", "subcategory_id", "category_path", "vendor",
-    "payment_method", "payment_reference", "payment_status", "notes", "receipt_reference", "expense_type",
-    "project_phase",
-]
-
-
-def validate_expense_payload(data, partial=False):
-    """Return (clean_values, error)."""
-    values = {}
-    if "description" in data or not partial:
-        desc = clean_str(data.get("description"), 300)
-        if len(desc) < 2:
-            return None, "Description is required (at least 2 characters)."
-        values["description"] = desc
-    if "amount" in data or not partial:
-        amount = parse_amount(data.get("amount"))
-        if amount is None:
-            return None, "Enter a valid amount greater than 0."
-        values["amount"] = amount
-    if "transaction_date" in data or not partial:
-        date = parse_date(data.get("transaction_date"))
-        if not date:
-            return None, "Enter a valid transaction date (YYYY-MM-DD)."
-        if date > utcnow() + timedelta(days=1):
-            return None, "Transaction date cannot be in the future."
-        values["transaction_date"] = date
-    if "category_id" in data or not partial:
-        selected = data.get("subcategory_id") or data.get("category_id")
-        if not selected:
-            return None, "Choose a category."
-        cat = categories_col.find_one({"_id": to_oid(selected), "status": "active"}) if to_oid(selected) else None
-        if not cat:
-            return None, "Choose a valid, active category."
-        top, sub = resolve_category_pair(selected)
-        values["category_id"] = top
-        values["subcategory_id"] = sub
-        values["category_path"] = cat["path"]
-    if "vendor" in data:
-        values["vendor"] = clean_str(data.get("vendor"), 120)
-    if "payment_method" in data:
-        pm = clean_str(data.get("payment_method"), 40)
-        if pm and pm not in PAYMENT_METHODS:
-            return None, "Choose a valid payment method."
-        values["payment_method"] = pm
-    if "payment_status" in data:
-        ps = clean_str(data.get("payment_status"), 40)
-        if ps and ps not in PAYMENT_STATUSES:
-            return None, "Choose a valid payment status."
-        values["payment_status"] = ps
-    if "expense_type" in data:
-        et = clean_str(data.get("expense_type"), 40)
-        if et and et not in EXPENSE_TYPES:
-            return None, "Choose a valid expense type."
-        values["expense_type"] = et
-    for field, limit in (("payment_reference", 120), ("notes", 2000), ("receipt_reference", 120), ("project_phase", 120)):
-        if field in data:
-            values[field] = clean_str(data.get(field), limit)
-    return values, None
+EDITABLE_FIELDS = ["description", "amount", "transaction_date", "category_id", "subcategory_id", "category_path", "payments", "vendor",
+                   "payment_method", "payment_reference", "payment_status", "notes", "receipt_reference", "expense_type", "project_phase", "custom"]
 
 
 def snapshot(exp):
     return {k: serialize(exp.get(k)) for k in EDITABLE_FIELDS}
 
 
+def validate_payments(raw, amount, project):
+    """payments = [{partner_id, amount}] must add up to the expense amount."""
+    partners = {p["id"]: p for p in project.get("partners", [])}
+    if not isinstance(raw, list) or not raw:
+        return None, "Record who paid for this expense."
+    out, total, seen = [], 0.0, set()
+    for item in raw:
+        pid = item.get("partner_id")
+        if pid not in partners:
+            return None, "Unknown partner in the payment split."
+        if pid in seen:
+            return None, "A partner appears twice in the split."
+        paid = parse_amount(item.get("amount"), allow_zero=True)
+        if paid is None:
+            return None, f"Enter a valid amount for {partners[pid]['name']}."
+        if paid > 0:
+            seen.add(pid)
+            out.append({"partner_id": pid, "partner_name": partners[pid]["name"], "amount": paid})
+            total += paid
+    if not out:
+        return None, "Record who paid for this expense."
+    if abs(total - amount) > 0.01:
+        return None, f"The split (₹{total:,.2f}) must equal the expense amount (₹{amount:,.2f})."
+    return out, None
+
+
+def validate_custom(raw, project):
+    out = {}
+    for f in project.get("custom_fields", []):
+        v = (raw or {}).get(f["key"])
+        if v in (None, ""):
+            if f.get("required"):
+                return None, f"{f['label']} is required."
+            continue
+        if f["type"] == "number":
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None, f"{f['label']} must be a number."
+        elif f["type"] == "date":
+            if not parse_date(v):
+                return None, f"{f['label']} must be a valid date."
+            v = str(v)[:10]
+        elif f["type"] == "select":
+            if v not in f.get("options", []):
+                return None, f"Choose a valid option for {f['label']}."
+        else:
+            v = clean_str(v, 300)
+        out[f["key"]] = v
+    return out, None
+
+
+def validate_expense_payload(data, project, partial=False):
+    values = {}
+    cfg = project.get("field_config") or DEFAULT_FIELD_CONFIG
+    if "description" in data or not partial:
+        desc = clean_str(data.get("description"), 300)
+        if len(desc) < 2:
+            return None, "Description is required."
+        values["description"] = desc
+    if "amount" in data or not partial:
+        amount = parse_amount(data.get("amount"))
+        if amount is None:
+            return None, "Enter an amount greater than 0."
+        values["amount"] = amount
+    if "transaction_date" in data or not partial:
+        date = parse_date(data.get("transaction_date"))
+        if not date:
+            return None, "Enter a valid date."
+        if date > utcnow() + timedelta(days=1):
+            return None, "Date cannot be in the future."
+        values["transaction_date"] = date
+    if "category_id" in data or "subcategory_id" in data or not partial:
+        selected = data.get("subcategory_id") or data.get("category_id")
+        if not selected:
+            return None, "Choose a category."
+        cat = categories_col.find_one({"_id": to_oid(selected), "status": "active", "project_id": str(project["_id"])}) if to_oid(selected) else None
+        if not cat:
+            return None, "Choose a valid category."
+        values["category_id"], values["subcategory_id"] = resolve_category_pair(selected)
+        values["category_path"] = cat["path"]
+    for key, label in OPTIONAL_FIELDS:
+        c = cfg.get(key, {"enabled": False, "required": False})
+        if key in data:
+            v = clean_str(data.get(key), 2000 if key == "notes" else 120)
+            if key == "payment_method" and v and v not in PAYMENT_METHODS:
+                return None, "Choose a valid payment method."
+            if key == "payment_status" and v and v not in PAYMENT_STATUSES:
+                return None, "Choose a valid payment status."
+            if key == "expense_type" and v and v not in EXPENSE_TYPES:
+                return None, "Choose a valid expense type."
+            values[key] = v
+        if c.get("enabled") and c.get("required") and (not partial or key in data) and not values.get(key):
+            return None, f"{label} is required."
+    if "custom" in data or not partial:
+        custom, err = validate_custom(data.get("custom") or {}, project)
+        if err:
+            return None, err
+        values["custom"] = custom
+    return values, None
+
+
 def apply_edit(exp, values, reason):
-    """Apply an edit with optimistic concurrency and write a revision record."""
-    changes = {}
-    for k, v in values.items():
-        old = exp.get(k)
-        if serialize(old) != serialize(v):
-            changes[k] = {"from": serialize(old), "to": serialize(v)}
+    changes = {k: {"from": serialize(exp.get(k)), "to": serialize(v)} for k, v in values.items() if serialize(exp.get(k)) != serialize(v)}
     if not changes:
         return exp, {}
-    new_revision = exp.get("revision", 1) + 1
+    new_rev = exp.get("revision", 1) + 1
     updated = expenses_col.find_one_and_update(
         {"_id": exp["_id"], "revision": exp.get("revision", 1)},
-        {"$set": dict(values, revision=new_revision, updated_at=utcnow(),
-                      modified_by=str(g.user["_id"]), modified_by_name=g.user.get("full_name") or g.user["username"])},
-        return_document=ReturnDocument.AFTER,
-    )
+        {"$set": dict(values, revision=new_rev, updated_at=utcnow(), modified_by=str(g.user["_id"]), modified_by_name=user_display(g.user))},
+        return_document=ReturnDocument.AFTER)
     if not updated:
         return None, None
-    revisions_col.insert_one({
-        "expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_revision, "action": "edit",
-        "changes": changes, "snapshot_before": snapshot(exp), "snapshot_after": snapshot(updated),
-        "user_id": str(g.user["_id"]), "user_name": g.user.get("full_name") or g.user["username"],
-        "at": utcnow(), "reason": reason,
-    })
-    record_audit("expense_edited", "expense", exp["expense_id"], {"revision": new_revision, "changes": changes, "reason": reason})
+    revisions_col.insert_one({"expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_rev, "action": "edit", "changes": changes,
+                              "snapshot_before": snapshot(exp), "snapshot_after": snapshot(updated), "user_id": str(g.user["_id"]),
+                              "user_name": user_display(g.user), "at": utcnow(), "reason": reason})
+    record_audit("expense_edited", "expense", exp["expense_id"], {"revision": new_rev, "changes": changes, "reason": reason},
+                 project_id=exp.get("project_id"))
     return updated, changes
 
 
-def build_expense_query(args, user):
-    """Translate query-string filters into a MongoDB query. Returns (query, error)."""
-    query = {}
+def build_expense_query(args, user, project_id):
+    query = {"project_id": project_id}
     status = args.get("status", "active")
     if status in ("deleted", "all") and not has_permission(user, "expense:view_deleted"):
         status = "active"
     if status == "deleted":
         query["status"] = "deleted"
     elif status == "edited":
+        query["status"], query["revision"] = "active", {"$gt": 1}
+    elif status != "all":
         query["status"] = "active"
-        query["revision"] = {"$gt": 1}
-    elif status == "all":
-        pass
-    else:
-        query["status"] = "active"
-
     q = clean_str(args.get("q"), 120)
     if q:
         rx = {"$regex": re.escape(q), "$options": "i"}
@@ -1037,109 +1116,71 @@ def build_expense_query(args, user):
 
     def multi(name):
         raw = args.getlist(name) if hasattr(args, "getlist") else [args.get(name)]
-        vals = []
-        for r in raw:
-            if r:
-                vals.extend([v.strip() for v in str(r).split(",") if v.strip()])
-        return vals
+        return [v.strip() for r in raw if r for v in str(r).split(",") if v.strip()]
 
-    cat_ids = multi("category_id")
-    sub_ids = multi("subcategory_id")
-    cat_or_sub = []
-    if cat_ids:
-        cat_or_sub.append({"category_id": {"$in": cat_ids}})
-    if sub_ids:
-        cat_or_sub.append({"subcategory_id": {"$in": sub_ids}})
-    if cat_or_sub:
-        if args.get("logic") == "any" and len(cat_or_sub) > 1:
-            query.setdefault("$and", []).append({"$or": cat_or_sub})
+    clauses = []
+    if multi("category_id"):
+        clauses.append({"category_id": {"$in": multi("category_id")}})
+    if multi("subcategory_id"):
+        clauses.append({"subcategory_id": {"$in": multi("subcategory_id")}})
+    if clauses:
+        if args.get("logic") == "any" and len(clauses) > 1:
+            query.setdefault("$and", []).append({"$or": clauses})
         else:
-            for clause in cat_or_sub:
-                query.update(clause)
-
+            for c in clauses:
+                query.update(c)
     for name in ("vendor", "payment_method", "payment_status", "expense_type", "project_phase"):
-        vals = multi(name)
-        if vals:
-            query[name] = {"$in": vals}
-
-    date_from = parse_date(args.get("date_from"))
-    date_to = parse_date(args.get("date_to"), end_of_day=True)
-    if args.get("date_from") and not date_from:
+        if multi(name):
+            query[name] = {"$in": multi(name)}
+    if multi("partner_id"):
+        query["payments.partner_id"] = {"$in": multi("partner_id")}
+    df, dt = parse_date(args.get("date_from")), parse_date(args.get("date_to"), end_of_day=True)
+    if args.get("date_from") and not df:
         return None, "Invalid 'from' date."
-    if args.get("date_to") and not date_to:
+    if args.get("date_to") and not dt:
         return None, "Invalid 'to' date."
-    if args.get("year") and not date_from and not date_to:
-        try:
-            y = int(args["year"])
-            m = int(args.get("month") or 0)
-            if m:
-                date_from = datetime(y, m, 1, tzinfo=timezone.utc)
-                date_to = (datetime(y + (m // 12), (m % 12) + 1, 1, tzinfo=timezone.utc) - timedelta(milliseconds=1))
-            else:
-                date_from = datetime(y, 1, 1, tzinfo=timezone.utc)
-                date_to = datetime(y, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-        except ValueError:
-            return None, "Invalid year/month."
-    if date_from or date_to:
-        rng = {}
-        if date_from:
-            rng["$gte"] = date_from
-        if date_to:
-            rng["$lte"] = date_to
-        query["transaction_date"] = rng
-
+    if df or dt:
+        query["transaction_date"] = {k: v for k, v in (("$gte", df), ("$lte", dt)) if v}
     amt = {}
-    if args.get("min_amount"):
-        v = parse_amount(args["min_amount"])
-        if v is None:
-            return None, "Invalid minimum amount."
-        amt["$gte"] = v
-    if args.get("max_amount"):
-        v = parse_amount(args["max_amount"])
-        if v is None:
-            return None, "Invalid maximum amount."
-        amt["$lte"] = v
+    for key, op in (("min_amount", "$gte"), ("max_amount", "$lte")):
+        if args.get(key):
+            v = parse_amount(args[key], allow_zero=True)
+            if v is None:
+                return None, f"Invalid {key.replace('_', ' ')}."
+            amt[op] = v
     if amt:
         query["amount"] = amt
-    if args.get("created_by"):
-        query["created_by"] = args["created_by"]
     return query, None
 
 
-SORTABLE = {"transaction_date", "amount", "category_path", "vendor", "created_at", "updated_at", "expense_id", "description", "payment_method"}
+SORTABLE = {"transaction_date", "amount", "category_path", "vendor", "created_at", "updated_at", "expense_id", "description"}
 
 
 @app.route("/api/expenses")
 @require("expense:view")
+@require_project
 def api_expenses_list():
-    query, err = build_expense_query(request.args, g.user)
+    query, err = build_expense_query(request.args, g.user, g.project_id)
     if err:
         return json_error(err)
     sort_field = request.args.get("sort", "transaction_date")
-    if sort_field not in SORTABLE:
-        sort_field = "transaction_date"
+    sort_field = sort_field if sort_field in SORTABLE else "transaction_date"
     order = DESCENDING if request.args.get("order", "desc") == "desc" else ASCENDING
     try:
-        page = max(1, int(request.args.get("page", 1)))
-        per_page = min(200, max(5, int(request.args.get("per_page", 25))))
+        page, per_page = max(1, int(request.args.get("page", 1))), min(200, max(5, int(request.args.get("per_page", 25))))
     except ValueError:
         page, per_page = 1, 25
-    summary = list(expenses_col.aggregate([
-        {"$match": query}, {"$group": {"_id": None, "count": {"$sum": 1}, "total": {"$sum": "$amount"}}},
-    ]))
+    summary = list(expenses_col.aggregate([{"$match": query}, {"$group": {"_id": None, "count": {"$sum": 1}, "total": {"$sum": "$amount"}}}]))
     total_count = summary[0]["count"] if summary else 0
     total_amount = round(summary[0]["total"], 2) if summary else 0
-    cursor = (expenses_col.find(query).sort([(sort_field, order), ("_id", DESCENDING)])
-              .skip((page - 1) * per_page).limit(per_page))
-    return jsonify({
-        "items": serialize(list(cursor)), "page": page, "per_page": per_page,
-        "total_count": total_count, "total_amount": total_amount,
-        "pages": max(1, -(-total_count // per_page)),
-    })
+    items = list(expenses_col.find(query).sort([(sort_field, order), ("_id", DESCENDING)]).skip((page - 1) * per_page).limit(per_page))
+    return jsonify({"items": serialize(items), "page": page, "per_page": per_page, "total_count": total_count,
+                    "total_amount": total_amount, "pages": max(1, -(-total_count // per_page))})
 
 
 @app.route("/api/expenses", methods=["POST"])
 @require("expense:create")
+@require_project
 def api_expenses_create():
     data = request.get_json(silent=True) or {}
     idem_key = clean_str(request.headers.get("Idempotency-Key"), 128)
@@ -1147,19 +1188,18 @@ def api_expenses_create():
         prior = idempotency_col.find_one({"key": idem_key, "user_id": str(g.user["_id"])})
         if prior:
             return jsonify(prior["response"]), 200
-    values, err = validate_expense_payload(data)
+    values, err = validate_expense_payload(data, g.project)
+    if err:
+        return json_error(err)
+    payments, err = validate_payments(data.get("payments"), values["amount"], g.project)
     if err:
         return json_error(err)
     now = utcnow()
-    doc = dict(values)
-    doc.setdefault("vendor", ""); doc.setdefault("payment_method", ""); doc.setdefault("payment_reference", "")
-    doc.setdefault("payment_status", ""); doc.setdefault("notes", ""); doc.setdefault("receipt_reference", "")
-    doc.setdefault("expense_type", ""); doc.setdefault("project_phase", "")
-    doc.update({
-        "status": "active", "revision": 1, "created_by": str(g.user["_id"]),
-        "created_by_name": g.user.get("full_name") or g.user["username"], "created_at": now, "updated_at": now,
-        "deleted_by": None, "deleted_at": None, "deletion_reason": None, "restoration_history": [],
-    })
+    doc = {k: "" for k, _ in OPTIONAL_FIELDS}
+    doc.update(values)
+    doc.update({"project_id": g.project_id, "payments": payments, "status": "active", "revision": 1, "created_by": str(g.user["_id"]),
+                "created_by_name": user_display(g.user), "created_at": now, "updated_at": now, "deleted_by": None, "deleted_at": None,
+                "deletion_reason": None, "restoration_history": []})
     for _ in range(3):
         doc["expense_id"] = next_expense_id()
         try:
@@ -1167,15 +1207,13 @@ def api_expenses_create():
             break
         except DuplicateKeyError:
             doc.pop("_id", None)
-            continue
     else:
         return json_error("Could not generate a unique expense ID. Try again.", 500)
-    revisions_col.insert_one({
-        "expense_oid": doc["_id"], "expense_id": doc["expense_id"], "revision": 1, "action": "create",
-        "changes": {}, "snapshot_before": None, "snapshot_after": snapshot(doc),
-        "user_id": str(g.user["_id"]), "user_name": doc["created_by_name"], "at": now, "reason": "Created",
-    })
-    record_audit("expense_created", "expense", doc["expense_id"], {"amount": doc["amount"], "description": doc["description"]})
+    revisions_col.insert_one({"expense_oid": doc["_id"], "expense_id": doc["expense_id"], "revision": 1, "action": "create", "changes": {},
+                              "snapshot_before": None, "snapshot_after": snapshot(doc), "user_id": str(g.user["_id"]),
+                              "user_name": doc["created_by_name"], "at": now, "reason": "Created"})
+    record_audit("expense_created", "expense", doc["expense_id"],
+                 {"amount": doc["amount"], "description": doc["description"], "paid_by": [(p["partner_name"], p["amount"]) for p in payments]})
     response = {"expense": serialize(doc)}
     if idem_key:
         try:
@@ -1185,175 +1223,137 @@ def api_expenses_create():
     return jsonify(response), 201
 
 
-def load_expense_or_404(expense_ref):
+def load_expense(expense_ref):
     oid = to_oid(expense_ref)
     exp = expenses_col.find_one({"_id": oid}) if oid else None
-    if not exp:
-        exp = expenses_col.find_one({"expense_id": expense_ref})
-    return exp
+    return exp or expenses_col.find_one({"expense_id": expense_ref})
+
+
+@app.route("/api/expenses/meta")
+@require("expense:view")
+@require_project
+def api_expenses_meta():
+    base = {"project_id": g.project_id}
+    return jsonify({"vendors": sorted(v for v in expenses_col.distinct("vendor", base) if v),
+                    "phases": sorted(p for p in expenses_col.distinct("project_phase", base) if p)})
 
 
 @app.route("/api/expenses/<expense_ref>")
 @require("expense:view")
 def api_expenses_get(expense_ref):
-    exp = load_expense_or_404(expense_ref)
-    if not exp:
-        return json_error("Expense not found.", 404)
-    if exp["status"] == "deleted" and not has_permission(g.user, "expense:view_deleted"):
+    exp = load_expense(expense_ref)
+    if not exp or (exp["status"] == "deleted" and not has_permission(g.user, "expense:view_deleted")):
         return json_error("Expense not found.", 404)
     revisions = list(revisions_col.find({"expense_oid": exp["_id"]}).sort("revision", ASCENDING))
-    events = list(audit_col.find({"entity_type": "expense", "entity_id": exp["expense_id"]}).sort("at", ASCENDING))
-    return jsonify({"expense": serialize(exp), "revisions": serialize(revisions), "events": serialize(events)})
+    return jsonify({"expense": serialize(exp), "revisions": serialize(revisions)})
 
 
 @app.route("/api/expenses/<expense_ref>", methods=["PUT"])
 @require("expense:edit")
 def api_expenses_update(expense_ref):
-    exp = load_expense_or_404(expense_ref)
+    exp = load_expense(expense_ref)
     if not exp:
         return json_error("Expense not found.", 404)
     if exp["status"] == "deleted":
         return json_error("Restore this expense before editing it.", 409)
+    project = get_project_or_none(exp["project_id"])
     data = request.get_json(silent=True) or {}
     reason = clean_str(data.get("reason"), 300)
     if len(reason) < 3:
         return json_error("A reason for the change is required.")
     if "expected_revision" in data and int(data["expected_revision"]) != exp.get("revision", 1):
-        return json_error("This expense was changed by someone else. Reload and try again.", 409, current_revision=exp.get("revision"))
-    values, err = validate_expense_payload(data, partial=True)
+        return json_error("This expense was changed by someone else. Reload and try again.", 409)
+    values, err = validate_expense_payload(data, project, partial=True)
     if err:
         return json_error(err)
+    if "payments" in data or "amount" in values:
+        payments, err = validate_payments(data.get("payments", exp.get("payments")), values.get("amount", exp["amount"]), project)
+        if err:
+            return json_error(err)
+        values["payments"] = payments
     updated, changes = apply_edit(exp, values, reason)
     if updated is None:
         return json_error("This expense was changed by someone else. Reload and try again.", 409)
-    if not changes:
-        return jsonify({"expense": serialize(exp), "changes": {}, "message": "No changes detected."})
-    return jsonify({"expense": serialize(updated), "changes": changes})
+    return jsonify({"expense": serialize(updated), "changes": changes, "message": "" if changes else "No changes detected."})
 
 
 @app.route("/api/expenses/<expense_ref>", methods=["DELETE"])
 @require("expense:delete")
 def api_expenses_delete(expense_ref):
-    exp = load_expense_or_404(expense_ref)
+    exp = load_expense(expense_ref)
     if not exp:
         return json_error("Expense not found.", 404)
     data = request.get_json(silent=True) or {}
     reason = clean_str(data.get("reason"), 300)
-    permanent = bool(data.get("permanent"))
-    if permanent:
-        if not has_permission(g.user, "expense:purge"):
-            return json_error("Only administrators can permanently delete records.", 403)
+    if len(reason) < 3:
+        return json_error("A reason is required.")
+    if data.get("permanent"):
         if exp["status"] != "deleted":
-            return json_error("Soft-delete the expense before permanently removing it.", 409)
-        if len(reason) < 3:
-            return json_error("A reason is required for permanent deletion.")
+            return json_error("Delete the expense first, then remove it permanently.", 409)
         expenses_col.delete_one({"_id": exp["_id"]})
-        record_audit("expense_purged", "expense", exp["expense_id"], {"reason": reason, "snapshot": snapshot(exp)})
+        record_audit("expense_purged", "expense", exp["expense_id"], {"reason": reason, "snapshot": snapshot(exp)}, project_id=exp["project_id"])
         return jsonify({"ok": True, "permanent": True})
     if exp["status"] == "deleted":
         return json_error("This expense is already deleted.", 409)
-    if len(reason) < 3:
-        return json_error("A deletion reason is required.")
-    now = utcnow()
-    new_revision = exp.get("revision", 1) + 1
+    now, new_rev = utcnow(), exp.get("revision", 1) + 1
     updated = expenses_col.find_one_and_update(
         {"_id": exp["_id"], "status": "active"},
-        {"$set": {"status": "deleted", "deleted_by": str(g.user["_id"]), "deleted_by_name": g.user.get("full_name") or g.user["username"],
-                  "deleted_at": now, "deletion_reason": reason, "revision": new_revision, "updated_at": now}},
-        return_document=ReturnDocument.AFTER,
-    )
+        {"$set": {"status": "deleted", "deleted_by": str(g.user["_id"]), "deleted_by_name": user_display(g.user), "deleted_at": now,
+                  "deletion_reason": reason, "revision": new_rev, "updated_at": now}}, return_document=ReturnDocument.AFTER)
     if not updated:
         return json_error("This expense is already deleted.", 409)
-    revisions_col.insert_one({
-        "expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_revision, "action": "delete",
-        "changes": {"status": {"from": "active", "to": "deleted"}}, "snapshot_before": snapshot(exp),
-        "snapshot_after": snapshot(updated), "user_id": str(g.user["_id"]),
-        "user_name": g.user.get("full_name") or g.user["username"], "at": now, "reason": reason,
-    })
-    record_audit("expense_deleted", "expense", exp["expense_id"], {"reason": reason, "amount": exp["amount"]})
+    revisions_col.insert_one({"expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_rev, "action": "delete",
+                              "changes": {"status": {"from": "active", "to": "deleted"}}, "snapshot_before": snapshot(exp), "snapshot_after": snapshot(updated),
+                              "user_id": str(g.user["_id"]), "user_name": user_display(g.user), "at": now, "reason": reason})
+    record_audit("expense_deleted", "expense", exp["expense_id"], {"reason": reason, "amount": exp["amount"], "description": exp["description"]},
+                 project_id=exp["project_id"])
     return jsonify({"expense": serialize(updated)})
 
 
 @app.route("/api/expenses/<expense_ref>/restore", methods=["POST"])
 @require("expense:restore")
 def api_expenses_restore(expense_ref):
-    exp = load_expense_or_404(expense_ref)
+    exp = load_expense(expense_ref)
     if not exp:
         return json_error("Expense not found.", 404)
     if exp["status"] != "deleted":
         return json_error("This expense is not deleted.", 409)
-    data = request.get_json(silent=True) or {}
-    reason = clean_str(data.get("reason"), 300)
+    reason = clean_str((request.get_json(silent=True) or {}).get("reason"), 300)
     if len(reason) < 3:
-        return json_error("A reason for restoring is required.")
-    now = utcnow()
-    new_revision = exp.get("revision", 1) + 1
-    entry = {"restored_by": str(g.user["_id"]), "restored_by_name": g.user.get("full_name") or g.user["username"],
-             "restored_at": now, "reason": reason, "previous_deletion": {
-                 "deleted_by_name": exp.get("deleted_by_name"), "deleted_at": exp.get("deleted_at"), "reason": exp.get("deletion_reason")}}
+        return json_error("A reason is required.")
+    now, new_rev = utcnow(), exp.get("revision", 1) + 1
+    entry = {"restored_by_name": user_display(g.user), "restored_at": now, "reason": reason,
+             "previous_deletion": {"deleted_by_name": exp.get("deleted_by_name"), "deleted_at": exp.get("deleted_at"), "reason": exp.get("deletion_reason")}}
     updated = expenses_col.find_one_and_update(
         {"_id": exp["_id"], "status": "deleted"},
-        {"$set": {"status": "active", "deleted_by": None, "deleted_at": None, "deletion_reason": None,
-                  "revision": new_revision, "updated_at": now}, "$push": {"restoration_history": entry}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not updated:
-        return json_error("This expense is not deleted.", 409)
-    revisions_col.insert_one({
-        "expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_revision, "action": "restore",
-        "changes": {"status": {"from": "deleted", "to": "active"}}, "snapshot_before": snapshot(exp),
-        "snapshot_after": snapshot(updated), "user_id": str(g.user["_id"]),
-        "user_name": g.user.get("full_name") or g.user["username"], "at": now, "reason": reason,
-    })
-    record_audit("expense_restored", "expense", exp["expense_id"], {"reason": reason})
+        {"$set": {"status": "active", "deleted_by": None, "deleted_at": None, "deletion_reason": None, "revision": new_rev, "updated_at": now},
+         "$push": {"restoration_history": entry}}, return_document=ReturnDocument.AFTER)
+    revisions_col.insert_one({"expense_oid": exp["_id"], "expense_id": exp["expense_id"], "revision": new_rev, "action": "restore",
+                              "changes": {"status": {"from": "deleted", "to": "active"}}, "snapshot_before": snapshot(exp), "snapshot_after": snapshot(updated),
+                              "user_id": str(g.user["_id"]), "user_name": user_display(g.user), "at": now, "reason": reason})
+    record_audit("expense_restored", "expense", exp["expense_id"], {"reason": reason}, project_id=exp["project_id"])
     return jsonify({"expense": serialize(updated)})
 
 
-@app.route("/api/expenses/<expense_ref>/revisions")
-@require("expense:view")
-def api_expenses_revisions(expense_ref):
-    exp = load_expense_or_404(expense_ref)
-    if not exp:
-        return json_error("Expense not found.", 404)
-    revisions = list(revisions_col.find({"expense_oid": exp["_id"]}).sort("revision", ASCENDING))
-    return jsonify({"revisions": serialize(revisions)})
-
-
-@app.route("/api/expenses/meta")
-@require("expense:view")
-def api_expenses_meta():
-    """Distinct vendors / phases for filter dropdowns."""
-    vendors = sorted(v for v in expenses_col.distinct("vendor") if v)
-    phases = sorted(p for p in expenses_col.distinct("project_phase") if p)
-    years = sorted({d.year for d in expenses_col.distinct("transaction_date") if d}, reverse=True)
-    return jsonify({"vendors": vendors, "phases": phases, "years": years})
-
-
 # ---------------------------------------------------------------------------
-# Dashboard API
+# Dashboard
 # ---------------------------------------------------------------------------
 
 def period_range(args):
-    """Return (date_from, date_to, label) for a dashboard period."""
-    period = args.get("period", "this_month")
-    now = utcnow()
-    df = parse_date(args.get("date_from"))
-    dt = parse_date(args.get("date_to"), end_of_day=True)
+    period, now = args.get("period", "all_time"), utcnow()
+    df, dt = parse_date(args.get("date_from")), parse_date(args.get("date_to"), end_of_day=True)
     if df or dt:
         return df, dt, "Custom range"
     if period == "this_month":
         return datetime(now.year, now.month, 1, tzinfo=timezone.utc), None, now.strftime("%B %Y")
     if period == "last_month":
-        first = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-        last_month_end = first - timedelta(milliseconds=1)
-        return datetime(last_month_end.year, last_month_end.month, 1, tzinfo=timezone.utc), last_month_end, last_month_end.strftime("%B %Y")
+        end = datetime(now.year, now.month, 1, tzinfo=timezone.utc) - timedelta(milliseconds=1)
+        return datetime(end.year, end.month, 1, tzinfo=timezone.utc), end, end.strftime("%B %Y")
     if period == "this_quarter":
         qm = ((now.month - 1) // 3) * 3 + 1
         return datetime(now.year, qm, 1, tzinfo=timezone.utc), None, f"Q{(now.month - 1) // 3 + 1} {now.year}"
     if period == "this_year":
         return datetime(now.year, 1, 1, tzinfo=timezone.utc), None, str(now.year)
-    if period == "last_year":
-        return datetime(now.year - 1, 1, 1, tzinfo=timezone.utc), datetime(now.year - 1, 12, 31, 23, 59, 59, tzinfo=timezone.utc), str(now.year - 1)
     if period == "last_30_days":
         return now - timedelta(days=30), None, "Last 30 days"
     if period == "last_90_days":
@@ -1361,327 +1361,446 @@ def period_range(args):
     return None, None, "All time"
 
 
-@app.route("/api/dashboard/summary")
-@require("expense:view")
-def api_dashboard_summary():
-    date_from, date_to, label = period_range(request.args)
-    match = {"status": "active"}
-    if date_from or date_to:
-        rng = {}
-        if date_from:
-            rng["$gte"] = date_from
-        if date_to:
-            rng["$lte"] = date_to
-        match["transaction_date"] = rng
-
-    totals = list(expenses_col.aggregate([
-        {"$match": match},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1},
-                    "average": {"$avg": "$amount"}, "max": {"$max": "$amount"}}},
-    ]))
-    t = totals[0] if totals else {"total": 0, "count": 0, "average": 0, "max": 0}
-
-    largest = expenses_col.find_one(match, sort=[("amount", DESCENDING)])
-
-    by_category = list(expenses_col.aggregate([
-        {"$match": match},
-        {"$group": {"_id": "$category_id", "name": {"$first": {"$arrayElemAt": ["$category_path", 0]}},
-                    "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"total": -1}},
-    ]))
-    by_subcategory = list(expenses_col.aggregate([
-        {"$match": dict(match, subcategory_id={"$ne": None})},
-        {"$group": {"_id": "$subcategory_id", "path": {"$first": "$category_path"}, "category_id": {"$first": "$category_id"},
-                    "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"total": -1}}, {"$limit": 15},
-    ]))
-    by_payment = list(expenses_col.aggregate([
-        {"$match": match},
-        {"$group": {"_id": {"$ifNull": ["$payment_method", ""]}, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"total": -1}},
-    ]))
-    top_vendors = list(expenses_col.aggregate([
-        {"$match": dict(match, vendor={"$nin": ["", None]})},
-        {"$group": {"_id": "$vendor", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"total": -1}}, {"$limit": 8},
-    ]))
-    pending = list(expenses_col.aggregate([
-        {"$match": dict(match, payment_status={"$in": ["Pending", "Partially Paid"]})},
-        {"$group": {"_id": "$payment_status", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-    ]))
-    recent = list(expenses_col.find({"status": "active"}).sort([("created_at", DESCENDING)]).limit(8))
-
-    granularity = request.args.get("granularity") or ("day" if (date_from and (date_to or utcnow()) - date_from <= timedelta(days=62)) else "month")
-    trend = trend_series(match, granularity)
-
-    return jsonify({
-        "period": {"label": label, "date_from": serialize(date_from), "date_to": serialize(date_to)},
-        "totals": {"total": round(t["total"] or 0, 2), "count": t["count"], "average": round(t["average"] or 0, 2), "max": round(t["max"] or 0, 2)},
-        "largest": serialize(largest),
-        "by_category": [{"category_id": r["_id"], "name": r["name"] or "Uncategorised", "total": round(r["total"], 2), "count": r["count"]} for r in by_category],
-        "by_subcategory": [{"subcategory_id": r["_id"], "category_id": r["category_id"], "path": r["path"], "name": " > ".join(r["path"]),
-                            "total": round(r["total"], 2), "count": r["count"]} for r in by_subcategory],
-        "by_payment_method": [{"name": r["_id"] or "Not specified", "total": round(r["total"], 2), "count": r["count"]} for r in by_payment],
-        "top_vendors": [{"vendor": r["_id"], "total": round(r["total"], 2), "count": r["count"]} for r in top_vendors],
-        "pending": [{"status": r["_id"], "total": round(r["total"], 2), "count": r["count"]} for r in pending],
-        "recent": serialize(recent),
-        "trend": {"granularity": granularity, "points": trend},
-    })
+def partner_summary(project, match):
+    """Share vs actually paid for each partner, plus who should pay whom to settle."""
+    partners = [p for p in project.get("partners", []) if p.get("active", True)]
+    paid = {r["_id"]: round(r["total"], 2) for r in expenses_col.aggregate([
+        {"$match": match}, {"$unwind": "$payments"},
+        {"$group": {"_id": "$payments.partner_id", "total": {"$sum": "$payments.amount"}, "count": {"$sum": 1}}}])}
+    counts = {r["_id"]: r["count"] for r in expenses_col.aggregate([
+        {"$match": match}, {"$unwind": "$payments"}, {"$group": {"_id": "$payments.partner_id", "count": {"$sum": 1}}}])}
+    total = round(sum(paid.values()), 2)
+    rows = []
+    for p in project.get("partners", []):
+        if not p.get("active", True) and not paid.get(p["id"]):
+            continue
+        share = p["share"] if p.get("active", True) else 0
+        should = round(total * share / 100, 2)
+        actual = paid.get(p["id"], 0)
+        net = round(actual - should, 2)
+        paid_pct = round(actual / total * 100, 2) if total else 0
+        rows.append({"partner_id": p["id"], "name": p["name"], "phone": p.get("phone", ""), "active": p.get("active", True), "share": share,
+                     "should_bear": should, "paid": actual, "paid_pct": paid_pct, "pct_diff": round(paid_pct - share, 2),
+                     "net": net, "count": counts.get(p["id"], 0),
+                     "status": "paid_more" if net > 0.5 else ("deficit" if net < -0.5 else "balanced")})
+    # Settlement suggestion: who owes whom (greedy match of deficits to surpluses).
+    owes = sorted([[r["name"], -r["net"]] for r in rows if r["net"] < -0.5], key=lambda x: -x[1])
+    gets = sorted([[r["name"], r["net"]] for r in rows if r["net"] > 0.5], key=lambda x: -x[1])
+    settlements = []
+    i = j = 0
+    while i < len(owes) and j < len(gets):
+        amt = round(min(owes[i][1], gets[j][1]), 2)
+        settlements.append({"from": owes[i][0], "to": gets[j][0], "amount": amt})
+        owes[i][1] -= amt
+        gets[j][1] -= amt
+        if owes[i][1] < 0.5:
+            i += 1
+        if gets[j][1] < 0.5:
+            j += 1
+    return {"total": total, "partners": rows, "settlements": settlements}
 
 
-def trend_series(match, granularity):
+def trend_series(match, granularity, partner_id=None):
     fmt = {"day": "%Y-%m-%d", "month": "%Y-%m", "year": "%Y"}.get(granularity, "%Y-%m")
+    pre = [{"$match": match}]
+    amount = "$amount"
+    if partner_id:
+        pre += [{"$unwind": "$payments"}, {"$match": {"payments.partner_id": partner_id}}]
+        amount = "$payments.amount"
     if granularity == "quarter":
-        pipeline = [
-            {"$match": match},
-            {"$group": {"_id": {"y": {"$year": "$transaction_date"}, "q": {"$ceil": {"$divide": [{"$month": "$transaction_date"}, 3]}}},
-                        "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-            {"$sort": {"_id.y": 1, "_id.q": 1}},
-        ]
-        return [{"label": f"{r['_id']['y']}-Q{int(r['_id']['q'])}", "total": round(r["total"], 2), "count": r["count"]}
-                for r in expenses_col.aggregate(pipeline)]
-    pipeline = [
-        {"$match": match},
-        {"$group": {"_id": {"$dateToString": {"format": fmt, "date": "$transaction_date"}},
-                    "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"_id": 1}},
-    ]
+        pipeline = pre + [{"$group": {"_id": {"y": {"$year": "$transaction_date"}, "q": {"$ceil": {"$divide": [{"$month": "$transaction_date"}, 3]}}},
+                                      "total": {"$sum": amount}, "count": {"$sum": 1}}}, {"$sort": {"_id.y": 1, "_id.q": 1}}]
+        return [{"label": f"{r['_id']['y']}-Q{int(r['_id']['q'])}", "total": round(r["total"], 2), "count": r["count"]} for r in expenses_col.aggregate(pipeline)]
+    pipeline = pre + [{"$group": {"_id": {"$dateToString": {"format": fmt, "date": "$transaction_date"}}, "total": {"$sum": amount}, "count": {"$sum": 1}}},
+                      {"$sort": {"_id": 1}}]
     return [{"label": r["_id"], "total": round(r["total"], 2), "count": r["count"]} for r in expenses_col.aggregate(pipeline)]
 
 
-@app.route("/api/dashboard/trends")
-@require("expense:view")
-def api_dashboard_trends():
-    """Drill-down series: year -> month -> day."""
-    granularity = request.args.get("granularity", "month")
-    if granularity not in ("day", "month", "quarter", "year"):
-        granularity = "month"
-    query, err = build_expense_query(request.args, g.user)
-    if err:
-        return json_error(err)
-    query["status"] = "active"
-    return jsonify({"granularity": granularity, "points": trend_series(query, granularity)})
+def dashboard_data(project, args):
+    date_from, date_to, label = period_range(args)
+    match = {"project_id": str(project["_id"]), "status": "active"}
+    if date_from or date_to:
+        match["transaction_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+    partner_id = args.get("partner_id") or None
+    partner = next((p for p in project.get("partners", []) if p["id"] == partner_id), None) if partner_id else None
+    # When one partner is selected, every number below is "what this partner paid".
+    pre = [{"$match": match}]
+    amount = "$amount"
+    if partner:
+        pre += [{"$unwind": "$payments"}, {"$match": {"payments.partner_id": partner_id}}]
+        amount = "$payments.amount"
 
+    def group(key, extra=None, limit=None, sort=True):
+        g_ = {"_id": key, "total": {"$sum": amount}, "count": {"$sum": 1}}
+        g_.update(extra or {})
+        pipe = pre + [{"$group": g_}]
+        if sort:
+            pipe.append({"$sort": {"total": -1}})
+        if limit:
+            pipe.append({"$limit": limit})
+        return list(expenses_col.aggregate(pipe))
 
-def default_preferences(role):
-    layout = DEFAULT_LAYOUTS.get(role, DEFAULT_LAYOUTS["viewer"])
-    sizes = {w["id"]: w["size"] for w in DASHBOARD_WIDGETS}
+    totals = list(expenses_col.aggregate(pre + [{"$group": {"_id": None, "total": {"$sum": amount}, "count": {"$sum": 1},
+                                                             "average": {"$avg": amount}, "max": {"$max": amount}}}]))
+    t = totals[0] if totals else {"total": 0, "count": 0, "average": 0, "max": 0}
+    item_match = dict(match, **({"payments.partner_id": partner_id} if partner else {}))
+    largest = list(expenses_col.find(item_match).sort("amount", -1).limit(1))
+    by_category = group("$category_id", {"name": {"$first": {"$arrayElemAt": ["$category_path", 0]}}})
+    by_sub = list(expenses_col.aggregate(pre + [{"$match": {"subcategory_id": {"$ne": None}}},
+                                                {"$group": {"_id": "$subcategory_id", "path": {"$first": "$category_path"}, "category_id": {"$first": "$category_id"},
+                                                            "total": {"$sum": amount}, "count": {"$sum": 1}}}, {"$sort": {"total": -1}}, {"$limit": 15}]))
+    by_payment = group({"$ifNull": ["$payment_method", ""]})
+    top_vendors = list(expenses_col.aggregate(pre + [{"$match": {"vendor": {"$nin": ["", None]}}},
+                                                     {"$group": {"_id": "$vendor", "total": {"$sum": amount}, "count": {"$sum": 1}}}, {"$sort": {"total": -1}}, {"$limit": 8}]))
+    recent = list(expenses_col.find(item_match).sort([("transaction_date", -1), ("created_at", -1)]).limit(8))
+    span_days = ((date_to or utcnow()) - date_from).days if date_from else 9999
+    granularity = args.get("granularity") or ("day" if span_days <= 62 else "month")
     return {
-        "layout": [{"id": wid, "visible": True, "size": sizes.get(wid, "medium")} for wid in layout],
-        "default_period": "this_month",
-        "custom_range": {"date_from": None, "date_to": None},
-        "chart_type_category": "bar",
-        "trend_granularity": "auto",
+        "period": {"label": label, "date_from": serialize(date_from), "date_to": serialize(date_to)},
+        "partner_filter": {"partner_id": partner_id, "name": partner["name"]} if partner else None,
+        "totals": {"total": round(t["total"] or 0, 2), "count": t["count"], "average": round(t["average"] or 0, 2), "max": round(t["max"] or 0, 2)},
+        "largest": serialize(largest[0]) if largest else None,
+        "by_category": [{"category_id": r["_id"], "name": r["name"] or "Uncategorised", "total": round(r["total"], 2), "count": r["count"]} for r in by_category],
+        "by_subcategory": [{"subcategory_id": r["_id"], "category_id": r["category_id"], "name": " > ".join(r["path"]), "total": round(r["total"], 2), "count": r["count"]} for r in by_sub],
+        "by_payment_method": [{"name": r["_id"] or "Not specified", "total": round(r["total"], 2), "count": r["count"]} for r in by_payment],
+        "top_vendors": [{"vendor": r["_id"], "total": round(r["total"], 2), "count": r["count"]} for r in top_vendors],
+        "recent": serialize(recent),
+        "trend": {"granularity": granularity, "points": trend_series(match, granularity, partner_id)},
+        "partner_summary": partner_summary(project, match),
     }
+
+
+@app.route("/api/dashboard/summary")
+@require("expense:view")
+@require_project
+def api_dashboard_summary():
+    return jsonify(dashboard_data(g.project, request.args))
+
+
+def default_preferences():
+    sizes = {w["id"]: w["size"] for w in DASHBOARD_WIDGETS}
+    return {"layout": [{"id": w, "visible": True, "size": sizes[w]} for w in DEFAULT_LAYOUT], "default_period": "all_time",
+            "custom_range": {"date_from": None, "date_to": None}, "chart_type_category": "bar", "trend_granularity": "auto"}
 
 
 @app.route("/api/dashboard/preferences")
 @login_required
+@require_project
 def api_prefs_get():
-    doc = prefs_col.find_one({"user_id": str(g.user["_id"])})
-    prefs = doc["preferences"] if doc else default_preferences(g.user["role"])
-    return jsonify({"preferences": prefs, "is_default": doc is None})
+    doc = prefs_col.find_one({"user_id": str(g.user["_id"]), "project_id": g.project_id})
+    return jsonify({"preferences": doc["preferences"] if doc else default_preferences(), "is_default": doc is None})
 
 
 @app.route("/api/dashboard/preferences", methods=["PUT"])
 @require("dashboard:customize")
+@require_project
 def api_prefs_put():
     data = request.get_json(silent=True) or {}
-    valid_ids = {w["id"] for w in DASHBOARD_WIDGETS}
-    layout = []
-    seen = set()
+    valid = {w["id"] for w in DASHBOARD_WIDGETS}
+    layout, seen = [], set()
     for item in data.get("layout", []):
-        wid = item.get("id")
-        if wid in valid_ids and wid not in seen:
-            seen.add(wid)
-            layout.append({"id": wid, "visible": bool(item.get("visible", True)),
+        if item.get("id") in valid and item["id"] not in seen:
+            seen.add(item["id"])
+            layout.append({"id": item["id"], "visible": bool(item.get("visible", True)),
                            "size": item.get("size") if item.get("size") in ("small", "medium", "large") else "medium"})
     if not layout:
         return json_error("Choose at least one widget.")
-    period = data.get("default_period", "this_month")
-    if period not in ("this_month", "last_month", "this_quarter", "this_year", "last_year", "last_30_days", "last_90_days", "all_time", "custom"):
-        period = "this_month"
+    periods = ("this_month", "last_month", "this_quarter", "this_year", "last_30_days", "last_90_days", "all_time", "custom")
     cr = data.get("custom_range") or {}
-    prefs = {
-        "layout": layout, "default_period": period,
-        "custom_range": {"date_from": clean_str(cr.get("date_from"), 10) or None, "date_to": clean_str(cr.get("date_to"), 10) or None},
-        "chart_type_category": data.get("chart_type_category") if data.get("chart_type_category") in ("bar", "donut") else "bar",
-        "trend_granularity": data.get("trend_granularity") if data.get("trend_granularity") in ("auto", "day", "month", "quarter", "year") else "auto",
-    }
-    prefs_col.update_one({"user_id": str(g.user["_id"])}, {"$set": {"preferences": prefs, "updated_at": utcnow()}}, upsert=True)
+    prefs = {"layout": layout, "default_period": data.get("default_period") if data.get("default_period") in periods else "all_time",
+             "custom_range": {"date_from": clean_str(cr.get("date_from"), 10) or None, "date_to": clean_str(cr.get("date_to"), 10) or None},
+             "chart_type_category": data.get("chart_type_category") if data.get("chart_type_category") in ("bar", "donut") else "bar",
+             "trend_granularity": data.get("trend_granularity") if data.get("trend_granularity") in ("auto", "day", "month", "quarter", "year") else "auto"}
+    key = {"user_id": str(g.user["_id"]), "project_id": g.project_id}
+    try:
+        prefs_col.update_one(key, {"$set": {"preferences": prefs, "updated_at": utcnow()}}, upsert=True)
+    except DuplicateKeyError:
+        prefs_col.delete_many({"user_id": key["user_id"], "project_id": {"$exists": False}})
+        prefs_col.update_one(key, {"$set": {"preferences": prefs, "updated_at": utcnow()}}, upsert=True)
     return jsonify({"preferences": prefs})
 
 
 @app.route("/api/dashboard/preferences", methods=["DELETE"])
 @require("dashboard:customize")
+@require_project
 def api_prefs_reset():
-    prefs_col.delete_one({"user_id": str(g.user["_id"])})
-    return jsonify({"preferences": default_preferences(g.user["role"])})
+    prefs_col.delete_one({"user_id": str(g.user["_id"]), "project_id": g.project_id})
+    return jsonify({"preferences": default_preferences()})
 
 
 # ---------------------------------------------------------------------------
-# Saved filters API
+# Saved filters
 # ---------------------------------------------------------------------------
 
 @app.route("/api/filters")
 @login_required
+@require_project
 def api_filters_list():
-    docs = list(filters_col.find({"user_id": str(g.user["_id"])}).sort("name", ASCENDING))
-    return jsonify({"filters": serialize(docs)})
+    return jsonify({"filters": serialize(list(filters_col.find({"user_id": str(g.user["_id"]), "project_id": g.project_id}).sort("name", ASCENDING)))})
 
 
 @app.route("/api/filters", methods=["POST"])
 @login_required
+@require_project
 def api_filters_create():
     data = request.get_json(silent=True) or {}
-    name = clean_str(data.get("name"), 60)
-    params = data.get("params") or {}
+    name, params = clean_str(data.get("name"), 60), data.get("params") or {}
     if len(name) < 2 or not isinstance(params, dict):
         return json_error("Give the filter a name.")
-    clean_params = {k: clean_str(v, 200) for k, v in params.items() if v not in (None, "", [])}
-    doc = {"user_id": str(g.user["_id"]), "name": name, "params": clean_params, "created_at": utcnow()}
-    filters_col.update_one({"user_id": doc["user_id"], "name": name}, {"$set": doc}, upsert=True)
-    return jsonify({"filter": serialize(filters_col.find_one({"user_id": doc["user_id"], "name": name}))}), 201
+    clean = {}
+    for k, v in params.items():
+        if isinstance(v, list):
+            v = ",".join(clean_str(x, 100) for x in v if x not in (None, ""))
+        if v not in (None, "", False):
+            clean[clean_str(k, 40)] = clean_str(v, 200)
+    key = {"user_id": str(g.user["_id"]), "project_id": g.project_id, "name": name}
+    filters_col.update_one(key, {"$set": dict(key, params=clean, created_at=utcnow())}, upsert=True)
+    return jsonify({"filter": serialize(filters_col.find_one(key))}), 201
 
 
 @app.route("/api/filters/<filter_id>", methods=["DELETE"])
 @login_required
 def api_filters_delete(filter_id):
-    res = filters_col.delete_one({"_id": to_oid(filter_id), "user_id": str(g.user["_id"])})
-    if not res.deleted_count:
+    if not filters_col.delete_one({"_id": to_oid(filter_id), "user_id": str(g.user["_id"])}).deleted_count:
         return json_error("Filter not found.", 404)
     return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
-# Audit log API
+# Audit
 # ---------------------------------------------------------------------------
 
 @app.route("/api/audit")
 @require("audit:view")
 def api_audit():
     query = {}
+    kind = request.args.get("kind", "changes")
+    if kind == "logins":
+        query["action"] = {"$in": LOGIN_ACTIONS}
+    elif kind == "deleted":
+        query["action"] = {"$in": ["expense_deleted", "expense_restored", "expense_purged"]}
+    elif kind == "edits":
+        query["action"] = "expense_edited"
+    else:
+        query["action"] = {"$nin": LOGIN_ACTIONS}
     if request.args.get("action"):
         query["action"] = request.args["action"]
-    if request.args.get("entity_type"):
-        query["entity_type"] = request.args["entity_type"]
     if request.args.get("entity_id"):
         query["entity_id"] = request.args["entity_id"]
     if request.args.get("user_id"):
         query["user_id"] = request.args["user_id"]
-    df = parse_date(request.args.get("date_from"))
-    dt = parse_date(request.args.get("date_to"), end_of_day=True)
+    if g.project_id and kind != "logins":
+        query["$or"] = [{"project_id": g.project_id}, {"project_id": None}]
+    df, dt = parse_date(request.args.get("date_from")), parse_date(request.args.get("date_to"), end_of_day=True)
     if df or dt:
         query["at"] = {k: v for k, v in (("$gte", df), ("$lte", dt)) if v}
     try:
-        page = max(1, int(request.args.get("page", 1)))
-        per_page = min(200, max(10, int(request.args.get("per_page", 50))))
+        page, per_page = max(1, int(request.args.get("page", 1))), min(200, max(10, int(request.args.get("per_page", 50))))
     except ValueError:
         page, per_page = 1, 50
     total = audit_col.count_documents(query)
     docs = list(audit_col.find(query).sort("at", DESCENDING).skip((page - 1) * per_page).limit(per_page))
-    actions = sorted(a for a in audit_col.distinct("action") if a)
-    return jsonify({"items": serialize(docs), "total": total, "page": page, "pages": max(1, -(-total // per_page)), "actions": actions})
-
-
-# ---------------------------------------------------------------------------
-# Export, backup and restore
-# ---------------------------------------------------------------------------
-
-CSV_COLUMNS = [
-    ("expense_id", "Expense ID"), ("transaction_date", "Date"), ("description", "Description"), ("amount", "Amount (INR)"),
-    ("category", "Category"), ("subcategory", "Subcategory"), ("vendor", "Vendor"), ("payment_method", "Payment Method"),
-    ("payment_reference", "Payment Reference"), ("payment_status", "Payment Status"), ("expense_type", "Expense Type"),
-    ("project_phase", "Project / Phase"), ("receipt_reference", "Receipt / Invoice"), ("notes", "Notes"),
-    ("status", "Status"), ("revision", "Revision"), ("created_by_name", "Created By"), ("created_at", "Created At"),
-    ("updated_at", "Updated At"), ("deleted_by_name", "Deleted By"), ("deleted_at", "Deleted At"), ("deletion_reason", "Deletion Reason"),
-]
-
-
-def expense_csv_row(exp):
-    path = exp.get("category_path") or []
-    row = dict(exp)
-    row["category"] = path[0] if path else ""
-    row["subcategory"] = " > ".join(path[1:]) if len(path) > 1 else ""
-    row["transaction_date"] = exp["transaction_date"].strftime("%Y-%m-%d") if exp.get("transaction_date") else ""
-    for k in ("created_at", "updated_at", "deleted_at"):
-        v = exp.get(k)
-        row[k] = v.strftime("%Y-%m-%d %H:%M:%S") if isinstance(v, datetime) else ""
-    return [row.get(key, "") if row.get(key) is not None else "" for key, _ in CSV_COLUMNS]
-
-
-@app.route("/api/export/csv")
-@require("export")
-def api_export_csv():
-    query, err = build_expense_query(request.args, g.user)
-    if err:
-        return json_error(err)
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow([label for _, label in CSV_COLUMNS])
-    for exp in expenses_col.find(query).sort("transaction_date", ASCENDING):
-        writer.writerow(expense_csv_row(exp))
-    record_audit("export_csv", "export", None, {"filters": request.args.to_dict(flat=False)})
-    filename = f"expenses_{utcnow().strftime('%Y%m%d_%H%M')}.csv"
-    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"})
-
-
-@app.route("/api/export/json")
-@require("export")
-def api_export_json():
-    query, err = build_expense_query(request.args, g.user)
-    if err:
-        return json_error(err)
-    items = serialize(list(expenses_col.find(query).sort("transaction_date", ASCENDING)))
-    payload = {"exported_at": serialize(utcnow()), "filters": request.args.to_dict(flat=False), "count": len(items), "expenses": items}
-    if request.args.get("include_history") == "1" and has_permission(g.user, "audit:view"):
-        ids = [to_oid(i["id"]) for i in items]
-        payload["revisions"] = serialize(list(revisions_col.find({"expense_oid": {"$in": ids}}).sort([("expense_id", 1), ("revision", 1)])))
-    record_audit("export_json", "export", None, {"count": len(items)})
-    filename = f"expenses_{utcnow().strftime('%Y%m%d_%H%M')}.json"
-    return Response(json.dumps(payload, indent=2), mimetype="application/json",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return jsonify({"items": serialize(docs), "total": total, "page": page, "pages": max(1, -(-total // per_page)),
+                    "actions": sorted(a for a in audit_col.distinct("action") if a)})
 
 
 @app.route("/api/export/audit.csv")
 @require("audit:view")
 def api_export_audit_csv():
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["Time", "User", "Action", "Entity Type", "Entity ID", "IP", "Details"])
+    w = csv.writer(buf)
+    w.writerow(["Time (UTC)", "User", "Action", "Entity Type", "Entity ID", "IP", "Details"])
     for row in audit_col.find({}).sort("at", DESCENDING).limit(20000):
-        writer.writerow([row["at"].strftime("%Y-%m-%d %H:%M:%S"), row.get("user_name"), row.get("action"),
-                         row.get("entity_type"), row.get("entity_id"), row.get("ip"), json.dumps(serialize(row.get("details", {})))])
+        w.writerow([row["at"].strftime("%Y-%m-%d %H:%M:%S"), row.get("user_name"), row.get("action"), row.get("entity_type"),
+                    row.get("entity_id"), row.get("ip"), json.dumps(serialize(row.get("details", {})))])
     record_audit("export_audit", "export", None)
-    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": "attachment; filename=audit_log.csv"})
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=audit_log.csv"})
 
 
-BACKUP_VERSION = 1
-BACKUP_COLLECTIONS = ["expenses", "categories", "expense_revisions", "audit_logs", "dashboard_preferences", "saved_filters", "counters", "users"]
+# ---------------------------------------------------------------------------
+# Reports and exports (CSV + PDF)
+# ---------------------------------------------------------------------------
+
+def fmt_inr(n):
+    """Indian grouping: 12,34,567.00"""
+    n = float(n or 0)
+    neg = n < 0
+    whole, frac = f"{abs(n):.2f}".split(".")
+    if len(whole) > 3:
+        head, tail = whole[:-3], whole[-3:]
+        parts = []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        whole = ",".join(parts) + "," + tail
+    return ("-" if neg else "") + whole + "." + frac
 
 
-def build_backup(include_users=True):
-    data = {"format": "restaurant-expense-manager-backup", "version": BACKUP_VERSION,
-            "generated_at": serialize(utcnow()), "collections": {}}
-    for name in BACKUP_COLLECTIONS:
-        if name == "users" and not include_users:
-            continue
-        docs = []
-        for d in db[name].find({}):
-            docs.append(json.loads(json.dumps(d, default=_bson_default)))
-        data["collections"][name] = docs
-    return data
+def expense_rows(project, query):
+    partners = [p for p in project.get("partners", [])]
+    custom_fields = project.get("custom_fields", [])
+    cfg = project.get("field_config") or {}
+    head = ["Expense ID", "Date", "Description", "Category", "Subcategory", "Amount (INR)"] + [f"Paid by {p['name']}" for p in partners]
+    head += [label for key, label in OPTIONAL_FIELDS if cfg.get(key, {}).get("enabled")] + [f["label"] for f in custom_fields]
+    head += ["Status", "Revision", "Created By", "Created At"]
+    rows = []
+    for e in expenses_col.find(query).sort("transaction_date", ASCENDING):
+        path = e.get("category_path") or []
+        paid = {p["partner_id"]: p["amount"] for p in e.get("payments", [])}
+        row = [e["expense_id"], e["transaction_date"].strftime("%d-%m-%Y"), e["description"], path[0] if path else "",
+               " > ".join(path[1:]), e["amount"]] + [paid.get(p["id"], 0) or "" for p in partners]
+        row += [e.get(key, "") for key, _ in OPTIONAL_FIELDS if cfg.get(key, {}).get("enabled")]
+        row += [(e.get("custom") or {}).get(f["key"], "") for f in custom_fields]
+        row += [e["status"], e.get("revision", 1), e.get("created_by_name", ""), e["created_at"].strftime("%d-%m-%Y %H:%M")]
+        rows.append(row)
+    return head, rows
+
+
+def csv_response(filename, sheets):
+    """sheets = [(title, head, rows), ...] written one after another."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for i, (title, head, rows) in enumerate(sheets):
+        if i:
+            w.writerow([])
+        if title:
+            w.writerow([title])
+        w.writerow(head)
+        for r in rows:
+            w.writerow(r)
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+def pdf_response(filename, title, subtitle, sheets, landscape_mode=False):
+    try:
+        import reportlab  # noqa: F401
+    except ImportError:
+        return json_error("PDF support is not installed on the server. Run: pip install reportlab", 500)
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    buf = io.BytesIO()
+    page = landscape(A4) if landscape_mode else A4
+    doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=12 * mm, rightMargin=12 * mm, topMargin=14 * mm, bottomMargin=14 * mm, title=title)
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle("cell", parent=styles["BodyText"], fontSize=7.5, leading=9)
+    story = [Paragraph(title, styles["Title"]), Paragraph(subtitle, styles["Normal"]), Spacer(1, 6)]
+    for sheet_title, head, rows in sheets:
+        if sheet_title:
+            story += [Spacer(1, 8), Paragraph(sheet_title, styles["Heading3"])]
+        data = [[Paragraph(str(h), cell) for h in head]]
+        for r in rows:
+            data.append([Paragraph(fmt_inr(v) if isinstance(v, float) else str(v if v is not None else ""), cell) for v in r])
+        if len(data) == 1:
+            data.append([Paragraph("No records", cell)] + [""] * (len(head) - 1))
+        tbl = Table(data, repeatRows=1)
+        tbl.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e3efe9")), ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#b9c2bc")),
+                                 ("VALIGN", (0, 0), (-1, -1), "TOP"), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f8f6")])]))
+        story.append(tbl)
+    doc.build(story)
+    buf.seek(0)
+    return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+
+@app.route("/api/reports/<kind>.<fmt>")
+@require("export")
+@require_project
+def api_report(kind, fmt):
+    if fmt not in ("csv", "pdf") or kind not in ("full", "category", "partner", "expenses"):
+        abort(404)
+    args = request.args
+    query, err = build_expense_query(args, g.user, g.project_id)
+    if err:
+        return json_error(err)
+    date_from, date_to, label = period_range(args)
+    if date_from or date_to:
+        query["transaction_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+    data = dashboard_data(g.project, args)
+    stamp = utcnow().strftime("%Y%m%d_%H%M")
+    subtitle = f"Project: {g.project['name']} · Period: {label}" + (f" · Partner: {data['partner_filter']['name']}" if data["partner_filter"] else "") + \
+               f" · Generated {utcnow().strftime('%d-%m-%Y %H:%M')} UTC by {user_display(g.user)}"
+    total = data["totals"]["total"] or 1
+
+    cat_sheet = ("Category-wise summary", ["Category", "Expenses", "Amount (INR)", "Share %"],
+                 [[c["name"], c["count"], float(c["total"]), f"{c['total'] / total * 100:.1f}%"] for c in data["by_category"]] +
+                 [["TOTAL", data["totals"]["count"], float(data["totals"]["total"]), "100%"]])
+    sub_sheet = ("Subcategory-wise summary", ["Subcategory", "Expenses", "Amount (INR)"],
+                 [[c["name"], c["count"], float(c["total"])] for c in data["by_subcategory"]])
+    ps = data["partner_summary"]
+    partner_sheet = ("Partner-wise summary", ["Partner", "Share %", "Should bear (INR)", "Actually paid (INR)", "Paid %", "Net (paid − share)", "Status", "Payments"],
+                     [[p["name"], f"{p['share']:g}%", float(p["should_bear"]), float(p["paid"]), f"{p['paid_pct']:.1f}%", float(p["net"]),
+                       {"paid_more": "Paid more", "deficit": "Deficit", "balanced": "Balanced"}[p["status"]], p["count"]] for p in ps["partners"]] +
+                     [["TOTAL", "100%", float(ps["total"]), float(ps["total"]), "100%", 0.0, "", ""]])
+    settle_sheet = ("Settlement needed", ["From", "To", "Amount (INR)"], [[s["from"], s["to"], float(s["amount"])] for s in ps["settlements"]] or [["—", "Nothing to settle", 0.0]])
+    partner_cat = ("Partner payments by category", ["Category"] + [p["name"] for p in ps["partners"]] + ["Total"], partner_by_category(g.project, query, ps["partners"]))
+    head, rows = expense_rows(g.project, query)
+    expenses_sheet = ("All expenses", head, rows)
+
+    if kind == "category":
+        sheets, title = [cat_sheet, sub_sheet], "Category-wise report"
+    elif kind == "partner":
+        sheets, title = [partner_sheet, settle_sheet, partner_cat], "Partner-wise report"
+    elif kind == "expenses":
+        sheets, title = [expenses_sheet], "Expenses"
+    else:
+        sheets, title = [("Summary", ["Total expenses (INR)", "Number of expenses", "Average (INR)", "Largest (INR)"],
+                          [[float(data["totals"]["total"]), data["totals"]["count"], float(data["totals"]["average"]), float(data["totals"]["max"])]]),
+                         partner_sheet, settle_sheet, cat_sheet, sub_sheet, partner_cat, expenses_sheet], "Full expense report"
+    record_audit(f"report_{fmt}", "export", kind, {"period": label})
+    filename = f"{kind}_report_{stamp}.{fmt}"
+    if fmt == "csv":
+        return csv_response(filename, sheets)
+    return pdf_response(filename, f"{title} — {g.project['name']}", subtitle, sheets, landscape_mode=(kind in ("full", "expenses")))
+
+
+def partner_by_category(project, query, partner_rows):
+    rows = list(expenses_col.aggregate([{"$match": query}, {"$unwind": "$payments"},
+                                        {"$group": {"_id": {"cat": {"$arrayElemAt": ["$category_path", 0]}, "p": "$payments.partner_id"}, "total": {"$sum": "$payments.amount"}}}]))
+    by_cat = {}
+    for r in rows:
+        by_cat.setdefault(r["_id"]["cat"] or "Uncategorised", {})[r["_id"]["p"]] = round(r["total"], 2)
+    out = []
+    for cat, paid in sorted(by_cat.items(), key=lambda kv: -sum(kv[1].values())):
+        out.append([cat] + [float(paid.get(p["partner_id"], 0)) for p in partner_rows] + [float(sum(paid.values()))])
+    return out
+
+
+@app.route("/api/export/json")
+@require("export")
+@require_project
+def api_export_json():
+    query, err = build_expense_query(request.args, g.user, g.project_id)
+    if err:
+        return json_error(err)
+    items = serialize(list(expenses_col.find(query).sort("transaction_date", ASCENDING)))
+    payload = {"exported_at": serialize(utcnow()), "project": g.project["name"], "count": len(items), "expenses": items}
+    if request.args.get("include_history") == "1" and has_permission(g.user, "audit:view"):
+        payload["revisions"] = serialize(list(revisions_col.find({"expense_oid": {"$in": [to_oid(i["id"]) for i in items]}}).sort([("expense_id", 1), ("revision", 1)])))
+    record_audit("export_json", "export", None, {"count": len(items)})
+    return Response(json.dumps(payload, indent=2), mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename=expenses_{utcnow().strftime('%Y%m%d_%H%M')}.json"})
+
+
+# ---------------------------------------------------------------------------
+# Backups
+# ---------------------------------------------------------------------------
+
+BACKUP_VERSION = 2
+BACKUP_COLLECTIONS = ["projects", "expenses", "categories", "expense_revisions", "audit_logs", "dashboard_preferences", "saved_filters", "counters", "users"]
+_backup_event = threading.Event()
+_backup_reasons = []
+_backup_lock = threading.Lock()
 
 
 def _bson_default(o):
     if isinstance(o, ObjectId):
         return {"$oid": str(o)}
     if isinstance(o, datetime):
-        if o.tzinfo is None:
-            o = o.replace(tzinfo=timezone.utc)
-        return {"$date": o.isoformat()}
+        return {"$date": (o if o.tzinfo else o.replace(tzinfo=timezone.utc)).isoformat()}
     raise TypeError(f"Cannot serialise {type(o)}")
 
 
@@ -1689,12 +1808,139 @@ def _bson_restore(obj):
     if isinstance(obj, list):
         return [_bson_restore(x) for x in obj]
     if isinstance(obj, dict):
-        if set(obj.keys()) == {"$oid"}:
+        if set(obj) == {"$oid"}:
             return ObjectId(obj["$oid"])
-        if set(obj.keys()) == {"$date"}:
+        if set(obj) == {"$date"}:
             return datetime.fromisoformat(obj["$date"].replace("Z", "+00:00"))
         return {k: _bson_restore(v) for k, v in obj.items()}
     return obj
+
+
+def build_backup(include_users=True):
+    data = {"format": "restaurant-expense-manager-backup", "version": BACKUP_VERSION, "generated_at": serialize(utcnow()), "collections": {}}
+    for name in BACKUP_COLLECTIONS:
+        if name == "users" and not include_users:
+            continue
+        data["collections"][name] = [json.loads(json.dumps(d, default=_bson_default)) for d in db[name].find({})]
+    return data
+
+
+def request_backup(reason="change"):
+    if CONFIG["BACKUP_ON_CHANGE"]:
+        with _backup_lock:
+            _backup_reasons.append(reason)
+        _backup_event.set()
+
+
+BACKUP_FILENAME = "expense-manager-backup.json"
+
+
+def _write_atomic(path, text):
+    """Write to a temp file then rename, so a crash can never leave a half-written backup."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def write_backup_file(reason):
+    """
+    Replace the 3 identical copies (backups/copy_1..3/expense-manager-backup.json) with the
+    current data, and keep one dated copy per day in backups/history/. Returns a summary dict.
+    """
+    import hashlib
+    now = utcnow()
+    text = json.dumps(build_backup(include_users=True))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    copies = []
+    for i in range(1, CONFIG["BACKUP_COPIES"] + 1):
+        rel = f"copy_{i}/{BACKUP_FILENAME}"
+        _write_atomic(os.path.join(CONFIG["BACKUP_DIR"], rel), text)
+        copies.append(rel)
+    history_rel = f"history/{now.strftime('%Y-%m-%d')}.json"
+    _write_atomic(os.path.join(CONFIG["BACKUP_DIR"], history_rel), text)
+    prune_history()
+    backup_logs_col.insert_one({"type": "auto_change" if reason != "scheduled" else "scheduled", "reason": reason, "at": now, "file": history_rel,
+                                "copies": copies, "checksum": digest, "size": len(text.encode("utf-8"))})
+    return {"copies": copies, "history": history_rel, "checksum": digest}
+
+
+def write_safety_copy(label):
+    """A separate dated file that is never overwritten (used before a restore)."""
+    text = json.dumps(build_backup(include_users=True))
+    rel = f"history/{label}_{utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    _write_atomic(os.path.join(CONFIG["BACKUP_DIR"], rel), text)
+    return rel
+
+
+def prune_history():
+    hist = os.path.join(CONFIG["BACKUP_DIR"], "history")
+    if not os.path.isdir(hist):
+        return
+    cutoff = time.time() - CONFIG["BACKUP_HISTORY_DAYS"] * 86400
+    for fn in os.listdir(hist):
+        p = os.path.join(hist, fn)
+        if fn.endswith(".json") and re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", fn) and os.path.getmtime(p) < cutoff:
+            os.remove(p)
+
+
+def list_backup_files():
+    files = []
+    if os.path.isdir(CONFIG["BACKUP_DIR"]):
+        for root, _d, names in os.walk(CONFIG["BACKUP_DIR"]):
+            for fn in names:
+                if fn.endswith(".json"):
+                    p = os.path.join(root, fn)
+                    files.append({"name": os.path.relpath(p, CONFIG["BACKUP_DIR"]).replace(os.sep, "/"), "size": os.path.getsize(p),
+                                  "modified": serialize(datetime.fromtimestamp(os.path.getmtime(p), timezone.utc)), "_m": os.path.getmtime(p)})
+    files.sort(key=lambda f: (1, -f["_m"], "") if not f["name"].startswith("copy_") else (0, 0, f["name"]))
+    for f in files:
+        f.pop("_m")
+    return files
+
+
+def copies_status():
+    """Check that the 3 copies exist and are identical."""
+    import hashlib
+    out = []
+    for i in range(1, CONFIG["BACKUP_COPIES"] + 1):
+        p = os.path.join(CONFIG["BACKUP_DIR"], f"copy_{i}", BACKUP_FILENAME)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                out.append({"copy": i, "exists": True, "checksum": hashlib.sha256(fh.read()).hexdigest()[:16], "size": os.path.getsize(p),
+                            "modified": serialize(datetime.fromtimestamp(os.path.getmtime(p), timezone.utc))})
+        else:
+            out.append({"copy": i, "exists": False})
+    sums = {c["checksum"] for c in out if c.get("exists")}
+    return {"copies": out, "all_identical": len(sums) == 1 and all(c["exists"] for c in out)}
+
+
+def change_backup_worker():
+    while True:
+        _backup_event.wait()
+        time.sleep(CONFIG["BACKUP_DEBOUNCE_SECONDS"])
+        _backup_event.clear()
+        with _backup_lock:
+            reasons, _backup_reasons[:] = list(_backup_reasons), []
+        if not reasons:
+            continue
+        try:
+            info = write_backup_file(reasons[-1] if len(set(reasons)) == 1 else f"{len(reasons)}_changes")
+            log.info("Backup copies refreshed (%s)", info["checksum"])
+        except Exception as exc:
+            log.exception("Change backup failed: %s", exc)
+
+
+def scheduled_backup_loop():
+    """Once a day: make sure today's history copy exists even if nothing changed."""
+    while True:
+        try:
+            today = os.path.join(CONFIG["BACKUP_DIR"], "history", utcnow().strftime("%Y-%m-%d") + ".json")
+            if not os.path.isfile(today):
+                write_backup_file("scheduled")
+        except Exception as exc:
+            log.exception("Scheduled backup failed: %s", exc)
+        time.sleep(CONFIG["BACKUP_INTERVAL_HOURS"] * 3600)
 
 
 @app.route("/api/backup")
@@ -1702,24 +1948,22 @@ def _bson_restore(obj):
 def api_backup_download():
     include_users = has_permission(g.user, "user:manage")
     data = build_backup(include_users=include_users)
-    filename = f"expense_manager_backup_{utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    backup_logs_col.insert_one({"type": "manual_download", "user_id": str(g.user["_id"]), "user_name": g.user.get("full_name"),
-                                "at": utcnow(), "counts": {k: len(v) for k, v in data["collections"].items()}})
-    record_audit("backup_downloaded", "backup", None, {"include_users": include_users})
+    backup_logs_col.insert_one({"type": "manual_download", "user_id": str(g.user["_id"]), "user_name": user_display(g.user), "at": utcnow(),
+                                "counts": {k: len(v) for k, v in data["collections"].items()}})
+    record_audit("backup_downloaded", "backup", None)
     return Response(json.dumps(data), mimetype="application/json",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+                    headers={"Content-Disposition": f"attachment; filename=expense_manager_backup_{utcnow().strftime('%Y%m%d_%H%M%S')}.json"})
 
 
 def validate_backup_payload(data):
-    problems = []
+    problems, summary = [], {}
     if not isinstance(data, dict) or data.get("format") != "restaurant-expense-manager-backup":
         return ["This file is not an Expense Manager backup."], {}
-    if data.get("version") != BACKUP_VERSION:
+    if data.get("version") not in (1, 2):
         problems.append(f"Unsupported backup version {data.get('version')}.")
     cols = data.get("collections") or {}
     if "expenses" not in cols or "categories" not in cols:
         problems.append("Backup is missing the expenses or categories collection.")
-    summary = {}
     for name, docs in cols.items():
         if name not in BACKUP_COLLECTIONS:
             problems.append(f"Unknown collection '{name}'.")
@@ -1727,31 +1971,17 @@ def validate_backup_payload(data):
         if not isinstance(docs, list):
             problems.append(f"Collection '{name}' must be a list.")
             continue
-        ids = set()
-        dup = 0
-        for d in docs:
-            if not isinstance(d, dict) or "_id" not in d:
-                problems.append(f"A record in '{name}' has no _id.")
-                break
-            key = json.dumps(d["_id"], sort_keys=True)
-            if key in ids:
-                dup += 1
-            ids.add(key)
-        if dup:
-            problems.append(f"{dup} duplicate _id value(s) in '{name}'.")
+        ids = [json.dumps(d.get("_id"), sort_keys=True) for d in docs if isinstance(d, dict)]
+        if len(ids) != len(set(ids)):
+            problems.append(f"Duplicate _id values in '{name}'.")
         if name == "expenses":
             eids = [d.get("expense_id") for d in docs if isinstance(d, dict)]
-            dups = len(eids) - len(set(eids))
-            if dups:
-                problems.append(f"{dups} duplicate expense ID(s) in the backup.")
-            for d in docs:
-                if isinstance(d, dict) and (not isinstance(d.get("amount"), (int, float)) or d.get("amount", 0) <= 0):
-                    problems.append(f"Expense {d.get('expense_id')} has an invalid amount.")
-                    break
+            if len(eids) != len(set(eids)):
+                problems.append("Duplicate expense IDs in the backup.")
         existing = 0
-        if name in ("expenses", "categories", "users"):
-            restored_ids = [_bson_restore(d["_id"]) for d in docs if isinstance(d, dict) and "_id" in d]
-            existing = db[name].count_documents({"_id": {"$in": restored_ids}}) if restored_ids else 0
+        if name in ("expenses", "categories", "users", "projects"):
+            restored = [_bson_restore(d["_id"]) for d in docs if isinstance(d, dict) and "_id" in d]
+            existing = db[name].count_documents({"_id": {"$in": restored}}) if restored else 0
         summary[name] = {"records": len(docs), "conflicts": existing}
     return problems, summary
 
@@ -1784,41 +2014,31 @@ def api_backup_restore():
     data, err = read_backup_from_request()
     if err:
         return json_error(err)
-    mode = request.form.get("mode") or (request.get_json(silent=True) or {}).get("mode") or "merge"
-    confirm = (request.form.get("confirm") or str((request.get_json(silent=True) or {}).get("confirm", ""))).lower() == "true"
+    body = request.get_json(silent=True) or {}
+    mode = request.form.get("mode") or body.get("mode") or "merge"
+    confirm = str(request.form.get("confirm") or body.get("confirm", "")).lower() == "true"
     if mode not in ("merge", "replace"):
         return json_error("Mode must be 'merge' or 'replace'.")
     if not confirm:
         return json_error("Confirmation is required before restoring.")
-    problems, summary = validate_backup_payload(data)
+    problems, _ = validate_backup_payload(data)
     if problems:
         return json_error("Backup failed validation.", 400, problems=problems)
-
-    # Safety backup before any restore.
-    pre = build_backup(include_users=True)
-    pre_path = os.path.join(CONFIG["BACKUP_DIR"], f"pre_restore_{utcnow().strftime('%Y%m%d_%H%M%S')}.json")
-    os.makedirs(CONFIG["BACKUP_DIR"], exist_ok=True)
-    with open(pre_path, "w", encoding="utf-8") as fh:
-        json.dump(pre, fh)
-
-    me_id = g.user["_id"]
+    pre = write_safety_copy("pre_restore")
+    me = g.user["_id"]
     results = {}
     for name in BACKUP_COLLECTIONS:
         docs = data["collections"].get(name)
         if docs is None:
             continue
         if name == "users":
-            # Never drop the user performing the restore; never import users without password hashes.
             docs = [d for d in docs if d.get("password_hash")]
         restored = [_bson_restore(d) for d in docs]
         inserted = updated = skipped = 0
         if mode == "replace":
-            if name == "users":
-                db[name].delete_many({"_id": {"$ne": me_id}})
-            else:
-                db[name].delete_many({})
+            db[name].delete_many({"_id": {"$ne": me}} if name == "users" else {})
         for d in restored:
-            if name == "users" and d["_id"] == me_id:
+            if name == "users" and d["_id"] == me:
                 skipped += 1
                 continue
             if mode == "replace":
@@ -1826,26 +2046,21 @@ def api_backup_restore():
                 inserted += 1
             else:
                 res = db[name].replace_one({"_id": d["_id"]}, d, upsert=True)
-                if res.upserted_id is not None:
-                    inserted += 1
-                else:
-                    updated += 1
+                inserted += res.upserted_id is not None
+                updated += res.upserted_id is None
         results[name] = {"inserted": inserted, "updated": updated, "skipped": skipped}
     ensure_indexes()
-    backup_logs_col.insert_one({"type": f"restore_{mode}", "user_id": str(me_id), "user_name": g.user.get("full_name"),
-                                "at": utcnow(), "results": results, "pre_restore_file": os.path.basename(pre_path)})
+    backup_logs_col.insert_one({"type": f"restore_{mode}", "user_id": str(me), "user_name": user_display(g.user), "at": utcnow(), "results": results, "pre_restore_file": pre})
     record_audit("backup_restored", "backup", None, {"mode": mode, "results": results})
-    return jsonify({"ok": True, "mode": mode, "results": results, "pre_restore_backup": os.path.basename(pre_path)})
+    return jsonify({"ok": True, "mode": mode, "results": results, "pre_restore_backup": pre})
 
 
 @app.route("/api/backup/logs")
 @require("backup:create")
 def api_backup_logs():
-    docs = list(backup_logs_col.find({}).sort("at", DESCENDING).limit(50))
     files = list_backup_files()
-    return jsonify({"logs": serialize(docs), "files": files[:60], "total_files": len(files),
-                    "schedule_hours": CONFIG["BACKUP_INTERVAL_HOURS"], "on_change": CONFIG["BACKUP_ON_CHANGE"],
-                    "retention_days": CONFIG["BACKUP_RETENTION_DAYS"]})
+    return jsonify({"logs": serialize(list(backup_logs_col.find({}).sort("at", DESCENDING).limit(30))), "files": files[:60], "total_files": len(files),
+                    "status": copies_status(), "copies": CONFIG["BACKUP_COPIES"], "history_days": CONFIG["BACKUP_HISTORY_DAYS"]})
 
 
 @app.route("/api/backup/files/<path:name>")
@@ -1861,128 +2076,8 @@ def api_backup_file(name):
     return send_file(path, as_attachment=True, download_name=name.replace("/", "_"))
 
 
-# --- automatic JSON backups -------------------------------------------------
-# Every data change requests a backup. A worker thread waits a few seconds so a
-# burst of edits produces one file, then writes a full snapshot to
-#   backups/<YYYY>/<MM>/<DD>/<HHMMSS>_<reason>.json
-# and refreshes backups/latest.json. Old snapshots are thinned to one per day
-# after BACKUP_RETENTION_DAYS.
-
-_backup_event = threading.Event()
-_backup_reasons = []
-_backup_lock = threading.Lock()
-
-
-def request_backup(reason="change"):
-    if not CONFIG["BACKUP_ON_CHANGE"]:
-        return
-    with _backup_lock:
-        _backup_reasons.append(reason)
-    _backup_event.set()
-
-
-def write_backup_file(reason, subfolder=True):
-    """Write a full JSON backup to disk and record it. Returns the relative path."""
-    now = utcnow()
-    data = build_backup(include_users=True)
-    if subfolder:
-        folder = os.path.join(CONFIG["BACKUP_DIR"], now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
-    else:
-        folder = CONFIG["BACKUP_DIR"]
-    os.makedirs(folder, exist_ok=True)
-    safe_reason = re.sub(r"[^a-z0-9_]+", "_", reason.lower())[:40]
-    path = os.path.join(folder, f"{now.strftime('%H%M%S')}_{safe_reason}.json" if subfolder else f"{safe_reason}_{now.strftime('%Y%m%d_%H%M%S')}.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, path)  # atomic: never leaves a half-written file
-    latest = os.path.join(CONFIG["BACKUP_DIR"], "latest.json")
-    with open(latest + ".tmp", "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
-    os.replace(latest + ".tmp", latest)
-    rel = os.path.relpath(path, CONFIG["BACKUP_DIR"]).replace(os.sep, "/")
-    backup_logs_col.insert_one({"type": "auto_change" if subfolder else "scheduled", "reason": reason, "at": now, "file": rel,
-                                "size": os.path.getsize(path), "counts": {k: len(v) for k, v in data["collections"].items()}})
-    return rel
-
-
-def list_backup_files():
-    """All backup files on disk, newest first, with paths relative to the backup folder."""
-    files = []
-    if not os.path.isdir(CONFIG["BACKUP_DIR"]):
-        return files
-    for root, _dirs, names in os.walk(CONFIG["BACKUP_DIR"]):
-        for fn in names:
-            if fn.endswith(".json"):
-                p = os.path.join(root, fn)
-                files.append({"name": os.path.relpath(p, CONFIG["BACKUP_DIR"]).replace(os.sep, "/"), "size": os.path.getsize(p),
-                              "modified": serialize(datetime.fromtimestamp(os.path.getmtime(p), timezone.utc)), "mtime": os.path.getmtime(p)})
-    files.sort(key=lambda f: f["mtime"], reverse=True)
-    for f in files:
-        f.pop("mtime", None)
-    return files
-
-
-def prune_change_backups():
-    """Keep every snapshot for the retention window; older days keep only their last snapshot."""
-    cutoff = time.time() - CONFIG["BACKUP_RETENTION_DAYS"] * 86400
-    by_day = {}
-    for root, _dirs, names in os.walk(CONFIG["BACKUP_DIR"]):
-        if root == CONFIG["BACKUP_DIR"]:
-            continue
-        for fn in names:
-            if fn.endswith(".json"):
-                p = os.path.join(root, fn)
-                if os.path.getmtime(p) < cutoff:
-                    by_day.setdefault(root, []).append(p)
-    for folder, paths in by_day.items():
-        paths.sort(key=os.path.getmtime)
-        for old in paths[:-1]:
-            os.remove(old)
-
-
-def change_backup_worker():
-    while True:
-        _backup_event.wait()
-        time.sleep(CONFIG["BACKUP_DEBOUNCE_SECONDS"])
-        _backup_event.clear()
-        with _backup_lock:
-            reasons = list(_backup_reasons)
-            _backup_reasons.clear()
-        if not reasons:
-            continue
-        try:
-            reason = reasons[-1] if len(set(reasons)) == 1 else f"{len(reasons)}_changes"
-            rel = write_backup_file(reason, subfolder=True)
-            prune_change_backups()
-            log.info("Change backup written: %s", rel)
-        except Exception as exc:  # never let a backup failure crash the worker
-            log.exception("Change backup failed: %s", exc)
-
-
-def scheduled_backup_loop():
-    """Background thread: write a full JSON backup every N hours and prune old ones."""
-    interval = CONFIG["BACKUP_INTERVAL_HOURS"] * 3600
-    while True:
-        try:
-            os.makedirs(CONFIG["BACKUP_DIR"], exist_ok=True)
-            # Skip if another worker already wrote a backup within this interval.
-            recent = [os.path.getmtime(os.path.join(CONFIG["BACKUP_DIR"], f)) for f in os.listdir(CONFIG["BACKUP_DIR"]) if f.startswith("scheduled_")]
-            if recent and time.time() - max(recent) < interval - 120:
-                time.sleep(interval - (time.time() - max(recent)))
-                continue
-            path = write_backup_file("scheduled", subfolder=False)
-            scheduled = sorted(f for f in os.listdir(CONFIG["BACKUP_DIR"]) if f.startswith("scheduled_"))
-            for old in scheduled[:-CONFIG["BACKUPS_TO_KEEP"]]:
-                os.remove(os.path.join(CONFIG["BACKUP_DIR"], old))
-            log.info("Scheduled backup written: %s", path)
-        except Exception as exc:  # keep the thread alive no matter what
-            log.exception("Scheduled backup failed: %s", exc)
-        time.sleep(interval)
-
-
 # ---------------------------------------------------------------------------
-# Error handlers
+# Errors and startup
 # ---------------------------------------------------------------------------
 
 @app.errorhandler(404)
@@ -2006,13 +2101,10 @@ def too_large(_):
 def server_error(exc):
     log.exception("Unhandled error: %s", exc)
     if request.path.startswith("/api/"):
-        return json_error("Something went wrong on the server. Try again.", 500)
+        extra = {"detail": f"{type(exc).__name__}: {exc}"} if os.environ.get("EM_DEBUG") == "1" else {}
+        return json_error("Something went wrong on the server. Try again.", 500, **extra)
     return render_template("error.html", code=500, message="Something went wrong. Try again."), 500
 
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 
 def init_app():
     check_database_connection()
@@ -2027,5 +2119,4 @@ if __name__ == "__main__":
     init_app()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 else:
-    # Running under gunicorn: `gunicorn -w 2 -b 127.0.0.1:8000 app:app`
     init_app()

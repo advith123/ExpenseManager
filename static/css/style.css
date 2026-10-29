@@ -267,13 +267,13 @@ details.adv summary { cursor: pointer; color: var(--brand); font-weight: 500; ma
 .detail-grid dt { font-size: 0.8rem; color: var(--muted); }
 .detail-grid dd { margin: 0; font-weight: 500; }
 .timeline { list-style: none; margin: 0; padding: 0; border-left: 2px solid var(--line); }
-.timeline li { padding: 0 0 14px 16px; position: relative; }
-.timeline li::before { content: ""; position: absolute; left: -7px; top: 5px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); border: 2px solid var(--brand); }
-.timeline li.delete::before { border-color: var(--danger); }
-.timeline li.restore::before { border-color: var(--accent); }
+.timeline > li { padding: 0 0 14px 16px; position: relative; }
+.timeline > li::before { content: ""; position: absolute; left: -7px; top: 5px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); border: 2px solid var(--brand); }
+.timeline > li.delete::before { border-color: var(--danger); }
+.timeline > li.restore::before { border-color: var(--accent); }
 .timeline .when { font-size: 0.8rem; color: var(--muted); }
 .diff { margin: 6px 0 0; padding: 0; list-style: none; font-size: 0.88rem; }
-.diff li { padding: 3px 0; }
+.diff li { padding: 3px 0 3px 10px; border-left: 2px solid var(--line); margin-left: 2px; }
 .diff .from { text-decoration: line-through; color: var(--danger); }
 .diff .to { color: var(--ok); font-weight: 500; }
 .reason { font-style: italic; color: var(--muted); }
@@ -373,3 +373,55 @@ details.adv summary { cursor: pointer; color: var(--brand); font-weight: 500; ma
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---------- v2: projects, partners, split payments ---------- */
+.nav-project { padding: 6px 12px 10px; display: flex; flex-direction: column; gap: 4px; }
+.nav-project label { font-size: 0.75rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.04em; }
+.nav-project select { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.1); color: inherit; font: inherit; }
+.nav-project select option { color: #17221d; }
+.split-rows { display: grid; gap: 8px; }
+.split-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px auto; gap: 8px; align-items: center; }
+.split-row input { min-height: 40px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); font: inherit; width: 100%; }
+.split-row .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.split-status { font-size: 0.85rem; margin-top: 6px; }
+.split-status.ok { color: var(--ok); }
+.split-status.bad { color: var(--danger); }
+.partner-table .tag { font-size: 0.8rem; white-space: normal; text-align: right; }
+.net-pos { color: var(--ok); font-weight: 600; }
+.net-neg { color: var(--danger); font-weight: 600; }
+.settle { margin-top: 10px; padding: 10px 12px; background: var(--accent-soft); border-radius: var(--radius-sm); font-weight: 500; }
+.inline-add { display: flex; gap: 6px; align-items: center; }
+.inline-add select { flex: 1; }
+.inline-add .btn { white-space: nowrap; }
+.partner-rows .split-row { grid-template-columns: minmax(0,1fr) 120px 90px auto auto; }
+.report-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.report-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; background: var(--surface-2); }
+.report-card h3 { margin-bottom: 4px; }
+.report-card p { color: var(--muted); font-size: 0.88rem; }
+.field-config-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.field-config-row label { font-size: 0.9rem; }
+.custom-row { display: grid; grid-template-columns: minmax(0,1fr) 110px minmax(0,1fr) auto auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+.custom-row input, .custom-row select { min-height: 38px; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); font: inherit; width: 100%; }
+@media (max-width: 860px) {
+  .split-row { grid-template-columns: minmax(0,1fr) 120px auto; }
+  .partner-rows .split-row { grid-template-columns: 1fr 1fr; }
+  .custom-row { grid-template-columns: 1fr 1fr; }
+  .field-config-row { grid-template-columns: 1fr auto auto; }
+}
+
+/* ---------- v2 fixes ---------- */
+input[type="checkbox"], .split-row input[type="checkbox"], .custom-row input[type="checkbox"], .field-config-row input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; padding: 0; margin: 0; accent-color: var(--brand); flex: none; }
+.chk { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 0.88rem; cursor: pointer; }
+.filters-foot select, .pager select, select.plain { padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); font: inherit; min-height: 40px; }
+.pager select { min-height: 32px; padding: 4px 8px; }
+.project-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; background: var(--surface); display: grid; gap: 10px; }
+.project-card h3 { margin: 0; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.project-card .stats { display: flex; flex-wrap: wrap; gap: 14px 24px; }
+.project-card .stat { display: flex; flex-direction: column; }
+.project-card .stat span { font-size: 0.78rem; color: var(--muted); }
+.project-card .stat strong { font-size: 1.05rem; }
+.project-card .partners { display: flex; flex-wrap: wrap; gap: 6px; }
+.project-card .partners .tag { font-size: 0.82rem; padding: 4px 10px; }
+.project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.copy-status { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.copy-status .tag { padding: 6px 10px; font-size: 0.85rem; }
