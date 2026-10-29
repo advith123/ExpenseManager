@@ -77,7 +77,7 @@
     main.innerHTML = '<div class="dash-toolbar no-print"><select id="r-period">' + EM.PERIODS.map(function (x) { return '<option value="' + x[0] + '"' + (x[0] === period ? " selected" : "") + '>' + x[1] + '</option>'; }).join("") + '</select>' +
       '<span id="r-custom"' + (period === "custom" ? "" : " hidden") + '><input type="date" id="r-from" value="' + esc(p.date_from || "") + '"> <input type="date" id="r-to" value="' + esc(p.date_to || "") + '"> <button class="btn btn-sm" id="r-apply">Apply</button></span>' +
       '<select id="r-partner"><option value="">All partners</option>' + partners.map(function (x) { return '<option value="' + esc(x.id) + '"' + (x.id === partnerId ? " selected" : "") + '>' + esc(x.name) + "'s payments only</option>"; }).join("") + '</select>' +
-      '<span style="flex:1"></span><button class="btn btn-sm" id="r-print">Print this page</button></div>' +
+      '<span style="flex:1"></span><a class="btn btn-primary btn-sm" href="#/custom">Custom reports</a><button class="btn btn-sm" id="r-print">Print this page</button></div>' +
       '<div class="panel no-print"><h2>Download reports</h2><div class="report-grid" id="r-cards"></div></div><div id="report"><div class="empty">Loading…</div></div>';
     function params() { var sel = $("#r-period").value, o = { period: sel, partner_id: $("#r-partner").value }; if (sel === "custom") { o.date_from = $("#r-from").value; o.date_to = $("#r-to").value; } return o; }
     $("#r-period").addEventListener("change", function () { $("#r-custom").hidden = this.value !== "custom"; if (this.value !== "custom") navigate("reports", params()); });
@@ -107,6 +107,138 @@
         '<div class="panel"><h3>By category</h3>' + table(["Category", "Expenses", "Amount", "Share"], d.by_category.map(function (c) { return [esc(c.name), c.count, fmtINR(c.total), (c.total / total * 100).toFixed(1) + "%"]; })) + '</div>' +
         '<div class="panel"><h3>By subcategory</h3>' + table(["Subcategory", "Expenses", "Amount"], d.by_subcategory.map(function (c) { return [esc(c.name), c.count, fmtINR(c.total)]; })) + '</div>' +
         '<div class="panel"><h3>By month</h3>' + table(["Month", "Expenses", "Amount"], d.trend.points.map(function (c) { return [esc(c.label), c.count, fmtINR(c.total)]; })) + '</div>';
+    });
+  };
+
+  // =================================================================== CUSTOM REPORT BUILDER
+  EM.views.custom = function (main, route, isCurrent) {
+    EM.setTitle("Custom reports · " + state.project.name);
+    var partners = state.project.partners.filter(function (x) { return x.active !== false; });
+    var spec = { rows: "expense", columns: ["date", "expense", "category", "total"].concat(partners.map(function (p) { return "paid:" + p.id; })), group_by: "", formulas: [], filters: { period: "all_time" } };
+    var currentId = null, currentName = "";
+    return Promise.all([api("GET", "/api/reports/custom/options"), api("GET", "/api/reports/custom")]).then(function (res) {
+      if (!isCurrent()) return;
+      var opt = res[0], saved = res[1].reports;
+      var canEdit = can("expense:edit");
+      main.innerHTML =
+        '<div class="panel"><div class="panel-head"><h2>Saved reports</h2><a class="btn btn-sm" href="#/reports">← Back to reports</a></div><div id="saved-list" class="btn-row"></div></div>' +
+        '<div class="panel"><h2 id="builder-title">Build a report</h2>' +
+        '<div class="form-grid">' +
+        '<div class="field"><label for="cr-rows">Each row is one…</label><select id="cr-rows">' + [["expense", "Expense"], ["category", "Category (totals)"], ["subcategory", "Subcategory (totals)"], ["partner", "Partner (totals)"], ["month", "Month (totals)"], ["vendor", "Vendor (totals)"]].map(function (x) { return '<option value="' + x[0] + '">' + x[1] + '</option>'; }).join("") + '</select></div>' +
+        '<div class="field" id="cr-group-wrap"><label for="cr-group">Group rows by (with subtotals)</label><select id="cr-group"><option value="">No grouping</option><option value="category">Category</option><option value="subcategory">Subcategory</option><option value="month">Month</option><option value="partner">Who paid</option><option value="vendor">Vendor</option></select></div>' +
+        '</div>' +
+        '<div class="field" id="cr-cols-wrap"><label>Columns (tick to include; use ↑↓ to order)</label><ul class="widget-pick" id="cr-cols"></ul></div>' +
+        '<div class="field"><label>Your own calculated columns</label><p class="muted small" style="margin:0 0 6px">Use + − * / and brackets with these names: <code id="cr-vars"></code>. Example: <code>Total * 0.18</code> or <code>' + esc(opt.formula_variables[3] || "Total") + ' - ' + esc(opt.formula_variables[4] || "Count") + '</code></p><div id="cr-formulas"></div><button type="button" class="btn btn-sm" id="cr-formula-add">+ Add calculated column</button></div>' +
+        '<h3 style="margin-top:14px">Filters</h3><div class="filters">' +
+        '<div class="f"><label for="cr-period">Period</label><select id="cr-period">' + EM.PERIODS.map(function (x) { return '<option value="' + x[0] + '">' + x[1] + '</option>'; }).join("") + '</select></div>' +
+        '<div class="f"><label for="cr-from">From</label><input type="date" id="cr-from"></div><div class="f"><label for="cr-to">To</label><input type="date" id="cr-to"></div>' +
+        '<div class="f"><label for="cr-partner">Paid by</label><select id="cr-partner"><option value="">Anyone</option>' + partners.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; }).join("") + '</select></div>' +
+        '<div class="f"><label for="cr-cat">Category</label><select id="cr-cat"><option value="">All</option>' + opt.categories.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join("") + '</select></div>' +
+        '<div class="f"><label for="cr-min">Min amount</label><input type="number" id="cr-min" min="0"></div><div class="f"><label for="cr-max">Max amount</label><input type="number" id="cr-max" min="0"></div>' +
+        '<div class="f"><label for="cr-q">Search text</label><input id="cr-q" placeholder="e.g. welder"></div></div>' +
+        '<div class="btn-row" style="margin-top:16px"><button class="btn btn-primary" id="cr-run">Generate report</button>' + (canEdit ? '<button class="btn" id="cr-save">Save report…</button>' : "") + '<button class="btn" id="cr-reset">Start over</button><span class="spacer" style="flex:1"></span><a class="btn btn-sm" id="cr-csv" href="#">CSV</a><a class="btn btn-sm" id="cr-pdf" href="#">PDF</a></div>' +
+        '<p class="form-error" id="cr-error" hidden></p></div>' +
+        '<div class="panel" id="cr-result"><div class="empty">Choose your columns and click “Generate report”.</div></div>';
+      $("#cr-vars").textContent = opt.formula_variables.join(", ");
+
+      // ---- columns list
+      var colsBox = $("#cr-cols");
+      function drawCols() {
+        var ordered = spec.columns.map(function (k) { return opt.columns.filter(function (c) { return c.key === k; })[0]; }).filter(Boolean);
+        var rest = opt.columns.filter(function (c) { return spec.columns.indexOf(c.key) < 0; });
+        var all = ordered.concat(rest);
+        var agg = spec.rows !== "expense" && spec.rows !== "partner";
+        colsBox.innerHTML = all.map(function (c) {
+          var on = spec.columns.indexOf(c.key) >= 0, dim = agg && c.kind === "text";
+          return '<li' + (dim ? ' style="opacity:.45"' : "") + '><span class="muted small">' + (c.kind === "number" ? "#" : "Aa") + '</span><label class="chk"><input type="checkbox" data-col="' + esc(c.key) + '"' + (on ? " checked" : "") + (dim ? " disabled" : "") + '> ' + esc(c.label) + '</label><span></span><span>' + (on ? '<button class="link-btn" data-up="' + esc(c.key) + '">↑</button><button class="link-btn" data-down="' + esc(c.key) + '">↓</button>' : "") + '</span></li>';
+        }).join("");
+      }
+      colsBox.addEventListener("change", function (e) {
+        var k = e.target.getAttribute("data-col"); if (!k) return;
+        if (e.target.checked) { if (spec.columns.indexOf(k) < 0) spec.columns.push(k); } else spec.columns = spec.columns.filter(function (x) { return x !== k; });
+        drawCols();
+      });
+      colsBox.addEventListener("click", function (e) {
+        var up = e.target.closest("[data-up]"), down = e.target.closest("[data-down]");
+        var k = up ? up.getAttribute("data-up") : down ? down.getAttribute("data-down") : null; if (!k) return;
+        var i = spec.columns.indexOf(k), j = up ? i - 1 : i + 1;
+        if (j < 0 || j >= spec.columns.length) return;
+        var t = spec.columns[i]; spec.columns[i] = spec.columns[j]; spec.columns[j] = t; drawCols();
+      });
+
+      // ---- formulas
+      var fBox = $("#cr-formulas");
+      function drawFormulas() {
+        fBox.innerHTML = spec.formulas.map(function (f, i) { return '<div class="split-row" style="grid-template-columns: minmax(0,1fr) minmax(0,2fr) auto"><input placeholder="Column name" value="' + esc(f.label) + '" data-fl="' + i + '"><input placeholder="Formula, e.g. Total * 0.18" value="' + esc(f.expr) + '" data-fe="' + i + '"><button type="button" class="link-btn danger" data-fx="' + i + '">Remove</button></div>'; }).join("");
+      }
+      fBox.addEventListener("input", function (e) { var i = e.target.getAttribute("data-fl"), j = e.target.getAttribute("data-fe"); if (i !== null) spec.formulas[+i].label = e.target.value; if (j !== null) spec.formulas[+j].expr = e.target.value; });
+      fBox.addEventListener("click", function (e) { var r = e.target.closest("[data-fx]"); if (r) { spec.formulas.splice(+r.getAttribute("data-fx"), 1); drawFormulas(); } });
+      $("#cr-formula-add").addEventListener("click", function () { spec.formulas.push({ label: "Column " + (spec.formulas.length + 1), expr: "" }); drawFormulas(); });
+
+      // ---- rows / group / filters
+      function applyToForm() {
+        $("#cr-rows").value = spec.rows; $("#cr-group").value = spec.group_by || "";
+        $("#cr-group-wrap").style.display = spec.rows === "expense" ? "" : "none";
+        $("#cr-cols-wrap").style.display = spec.rows === "partner" ? "none" : "";
+        var f = spec.filters || {};
+        $("#cr-period").value = f.period || "all_time"; $("#cr-from").value = f.date_from || ""; $("#cr-to").value = f.date_to || "";
+        $("#cr-partner").value = f.partner_id || ""; $("#cr-cat").value = f.category_id || ""; $("#cr-min").value = f.min_amount || ""; $("#cr-max").value = f.max_amount || ""; $("#cr-q").value = f.q || "";
+        drawCols(); drawFormulas();
+      }
+      function readForm() {
+        spec.rows = $("#cr-rows").value; spec.group_by = $("#cr-group").value;
+        var period = $("#cr-period").value;
+        spec.filters = { period: period === "custom" ? "" : period, date_from: period === "custom" ? $("#cr-from").value : "", date_to: period === "custom" ? $("#cr-to").value : "",
+          partner_id: $("#cr-partner").value, category_id: $("#cr-cat").value, min_amount: $("#cr-min").value, max_amount: $("#cr-max").value, q: $("#cr-q").value.trim() };
+        spec.formulas = spec.formulas.filter(function (f) { return f.expr.trim(); }).map(function (f) { return { label: f.label.trim() || "Column", expr: f.expr.trim() }; });
+        return spec;
+      }
+      $("#cr-rows").addEventListener("change", function () { spec.rows = this.value; applyToForm(); });
+      $("#cr-period").addEventListener("change", function () { var c = this.value === "custom"; $("#cr-from").disabled = !c; $("#cr-to").disabled = !c; });
+
+      function updateLinks() {
+        var q = { spec: JSON.stringify(readForm()), name: currentName || "Custom report" };
+        $("#cr-csv").href = EM.fileUrl("/api/reports/custom/download.csv", q); $("#cr-pdf").href = EM.fileUrl("/api/reports/custom/download.pdf", q);
+      }
+      function run() {
+        var err = $("#cr-error"); err.hidden = true;
+        readForm();
+        $("#cr-result").innerHTML = '<div class="empty">Generating…</div>';
+        api("POST", "/api/reports/custom/run", spec).then(function (r) {
+          updateLinks();
+          var numCols = r.head.map(function (_, i) { return r.rows.some(function (row) { return typeof row[i] === "number"; }); });
+          $("#cr-result").innerHTML = '<div class="panel-head"><h2>' + esc(currentName || "Report") + ' <span class="muted small">· ' + esc(r.period) + ' · ' + r.count + ' expenses</span></h2></div>' +
+            (r.ignored_text_columns && r.ignored_text_columns.length ? '<p class="muted small">Text columns (' + esc(r.ignored_text_columns.join(", ")) + ') are not shown for totals rows.</p>' : "") +
+            (r.rows.length <= 1 ? '<div class="empty">No expenses match these filters.</div>' :
+            '<div class="table-wrap"><table class="data"><thead><tr>' + r.head.map(function (h, i) { return '<th' + (numCols[i] ? ' class="amount"' : "") + '>' + esc(h) + '</th>'; }).join("") + '</tr></thead><tbody>' +
+            r.rows.map(function (row) {
+              var first = String(row[0]); var kind = first.indexOf("TOTAL") === 0 || first.indexOf("Subtotal") === 0 ? "total" : first.indexOf("—") === 0 ? "group" : "";
+              return '<tr' + (kind === "total" ? ' style="font-weight:600;background:var(--brand-soft)"' : kind === "group" ? ' style="background:var(--surface-2);font-weight:500"' : "") + '>' + row.map(function (c, i) { return '<td' + (numCols[i] ? ' class="amount"' : "") + '>' + (typeof c === "number" ? (r.head[i].indexOf("%") >= 0 || r.head[i] === "Count" ? c : fmtINR(c, 2)) : esc(c)) + '</td>'; }).join("") + '</tr>';
+            }).join("") + '</tbody></table></div>');
+        }).catch(function (e) { err.textContent = e.message; err.hidden = false; $("#cr-result").innerHTML = ""; });
+      }
+      $("#cr-run").addEventListener("click", run);
+      $("#cr-reset").addEventListener("click", function () { currentId = null; currentName = ""; $("#builder-title").textContent = "Build a report"; spec = { rows: "expense", columns: ["date", "expense", "category", "total"].concat(partners.map(function (p) { return "paid:" + p.id; })), group_by: "", formulas: [], filters: { period: "all_time" } }; applyToForm(); $("#cr-result").innerHTML = '<div class="empty">Choose your columns and click “Generate report”.</div>'; });
+      $("#cr-csv").addEventListener("click", updateLinks); $("#cr-pdf").addEventListener("click", updateLinks);
+      if ($("#cr-save")) $("#cr-save").addEventListener("click", function () {
+        var name = prompt("Name this report", currentName || ""); if (!name) return;
+        readForm();
+        api("POST", "/api/reports/custom", { name: name.trim(), spec: spec }).then(function (d) { currentId = d.report.id; currentName = d.report.name; $("#builder-title").textContent = "Report: " + currentName; toast("Report saved.", "ok"); return api("GET", "/api/reports/custom"); }).then(function (d) { saved = d.reports; drawSaved(); }).catch(fail);
+      });
+
+      // ---- saved list
+      function drawSaved() {
+        $("#saved-list").innerHTML = saved.length ? saved.map(function (r) { return '<span class="tag" style="padding:6px 10px;font-size:.9rem"><button class="link-btn" data-load="' + esc(r.id) + '" style="padding:0 4px">' + esc(r.name) + '</button> <a class="link-btn" href="' + EM.fileUrl("/api/reports/custom/download.csv", { report_id: r.id }) + '" title="CSV">CSV</a> <a class="link-btn" href="' + EM.fileUrl("/api/reports/custom/download.pdf", { report_id: r.id }) + '" title="PDF">PDF</a>' + (canEdit ? ' <button class="link-btn danger" data-del="' + esc(r.id) + '" title="Delete">×</button>' : "") + '</span>'; }).join("") : '<p class="muted small" style="margin:0">No saved reports yet. Build one below and click “Save report”.</p>';
+      }
+      $("#saved-list").addEventListener("click", function (e) {
+        var l = e.target.closest("[data-load]"), d = e.target.closest("[data-del]");
+        if (l) { var r = saved.filter(function (x) { return x.id === l.getAttribute("data-load"); })[0]; if (r) { spec = JSON.parse(JSON.stringify(r.spec)); spec.formulas = spec.formulas || []; spec.columns = spec.columns || []; currentId = r.id; currentName = r.name; $("#builder-title").textContent = "Report: " + r.name; applyToForm(); run(); } }
+        if (d) { var rr = saved.filter(function (x) { return x.id === d.getAttribute("data-del"); })[0]; if (rr && confirm("Delete report “" + rr.name + "”?")) api("DELETE", "/api/reports/custom/" + rr.id).then(function () { saved = saved.filter(function (x) { return x.id !== rr.id; }); drawSaved(); toast("Deleted.", "ok"); }).catch(fail); }
+      });
+      drawSaved(); applyToForm();
+      $("#cr-from").disabled = true; $("#cr-to").disabled = true;
+      var load = route.params.load && saved.filter(function (x) { return x.id === route.params.load; })[0];
+      if (load) { spec = JSON.parse(JSON.stringify(load.spec)); currentId = load.id; currentName = load.name; applyToForm(); run(); }
     });
   };
 

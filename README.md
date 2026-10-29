@@ -27,7 +27,8 @@ Open http://localhost:5000 — sign in as `admin` / `Admin@12345` and set a new 
 - **Partner view.** The dashboard and reports can be switched to one partner's payments only.
 - **Categories.** Pick a category, subcategories load for it. "+ New" on the expense form adds a category or subcategory on the spot.
 - **Expense fields.** Projects & partners → Expense fields: choose which optional fields to record (vendor, payment method, notes…), make them required, or add your own fields (text, number, date, dropdown).
-- **Reports.** Full report, category-wise, partner-wise and expense list — each as CSV (Excel) and PDF, for any period or partner.
+- **Reports.** Full report, category-wise, partner-wise (one column per partner) and expense list — each as CSV (Excel) and PDF, for any period or partner.
+- **Custom reports.** Reports → Custom reports: choose what each row is (expense, category, subcategory, partner, month, vendor), tick and order the columns (including per-partner paid / should bear / difference / running balance), group with subtotals, add your own calculated columns (e.g. `Total * 0.18`), filter, then generate, save by name, and download as CSV or PDF.
 - **Roles.** One `admin` (full control, the only one who can delete expenses and change partners), `editor` (partners: add/edit expenses, categories, downloads), `viewer` (read-only).
 - **Audit.** History & audit shows every change, edited expenses with before/after values and reason, deleted expenses with reason, and every sign-in, failed sign-in and sign-out with IP.
 - **Backups.** After every change the app rewrites three identical JSON copies — `backups/copy_1`, `copy_2`, `copy_3` — and the day's file in `backups/history/` (kept 30 days). Files are replaced atomically (written to a temp file, then renamed), never edited in place. If a copy is deleted, it is re-created on the next change. Settings shows whether all copies match. Download / restore under Settings.

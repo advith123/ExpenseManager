@@ -284,7 +284,7 @@ DATA_CHANGING_ACTIONS = {
     "expense_created", "expense_edited", "expense_deleted", "expense_restored", "expense_purged",
     "category_created", "category_updated", "category_archived", "category_restored",
     "project_created", "project_updated", "partners_updated", "fields_updated",
-    "user_created", "user_updated", "password_changed", "backup_restored",
+    "user_created", "user_updated", "password_changed", "backup_restored", "custom_report_saved", "custom_report_deleted",
 }
 LOGIN_ACTIONS = ["login", "login_failed", "logout", "password_changed", "permission_denied"]
 
@@ -1839,6 +1839,299 @@ def api_partner_table():
                     "by_category": partner_by_category(g.project, query, partners)})
 
 
+# ---------------------------------------------------------------------------
+# Custom report builder
+# ---------------------------------------------------------------------------
+
+custom_reports_col = db["custom_reports"]
+ROW_MODES = ["expense", "category", "subcategory", "partner", "month", "vendor"]
+GROUP_MODES = ["", "category", "subcategory", "month", "partner", "vendor"]
+TEXT_COLUMNS = [("date", "Date"), ("expense", "Expense"), ("category", "Category"), ("subcategory", "Subcategory"), ("vendor", "Vendor"),
+                ("payment_method", "Payment method"), ("payment_status", "Payment status"), ("notes", "Notes"), ("expense_id", "Expense ID")]
+NUM_COLUMNS = [("total", "Total"), ("count", "Count"), ("pct_total", "% of grand total")]
+PARTNER_COLUMNS = [("paid", "{name} paid"), ("share", "{name} should bear"), ("diff", "{name} paid − share"), ("running", "{name} running balance")]
+
+
+def _ident(name):
+    return re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_") or "x"
+
+
+def safe_eval(expr, variables):
+    """Evaluate + - * / % and parentheses over numbers and the given variable names. Nothing else."""
+    import ast as _ast
+    tree = _ast.parse(expr, mode="eval")
+
+    def ev(node):
+        if isinstance(node, _ast.Expression):
+            return ev(node.body)
+        if isinstance(node, _ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, _ast.Name):
+            if node.id not in variables:
+                raise ValueError(f"Unknown name '{node.id}'")
+            return float(variables[node.id] or 0)
+        if isinstance(node, _ast.UnaryOp) and isinstance(node.op, (_ast.USub, _ast.UAdd)):
+            v = ev(node.operand)
+            return -v if isinstance(node.op, _ast.USub) else v
+        if isinstance(node, _ast.BinOp):
+            a, b = ev(node.left), ev(node.right)
+            if isinstance(node.op, _ast.Add):
+                return a + b
+            if isinstance(node.op, _ast.Sub):
+                return a - b
+            if isinstance(node.op, _ast.Mult):
+                return a * b
+            if isinstance(node.op, _ast.Div):
+                return a / b if b else 0.0
+            if isinstance(node.op, _ast.Mod):
+                return a % b if b else 0.0
+        raise ValueError("Only numbers, column names, + - * / % and brackets are allowed.")
+    return round(ev(tree), 2)
+
+
+def custom_report_columns(project):
+    """The column list the builder can offer for this project."""
+    cols = [{"key": k, "label": l, "kind": "text"} for k, l in TEXT_COLUMNS]
+    cols += [{"key": f"custom:{f['key']}", "label": f["label"], "kind": "text"} for f in project.get("custom_fields", [])]
+    cols += [{"key": k, "label": l, "kind": "number"} for k, l in NUM_COLUMNS]
+    for p in project.get("partners", []):
+        if p.get("active", True):
+            for k, l in PARTNER_COLUMNS:
+                cols.append({"key": f"{k}:{p['id']}", "label": l.format(name=p["name"]), "kind": "number", "partner": p["name"]})
+    return cols
+
+
+def run_custom_report(project, spec, user):
+    rows_mode = spec.get("rows") if spec.get("rows") in ROW_MODES else "expense"
+    group_by = spec.get("group_by") if spec.get("group_by") in GROUP_MODES else ""
+    if rows_mode != "expense":
+        group_by = ""
+    wanted = [c for c in (spec.get("columns") or []) if isinstance(c, str)]
+    formulas = [{"label": clean_str(f.get("label"), 40), "expr": clean_str(f.get("expr"), 200)} for f in (spec.get("formulas") or []) if f.get("expr")]
+    filters = spec.get("filters") or {}
+
+    class Args(dict):
+        def getlist(self, k):
+            v = self.get(k)
+            return [] if v in (None, "") else [v] if not isinstance(v, list) else v
+    args = Args({k: v for k, v in filters.items() if v not in (None, "", [])})
+    query, err = build_expense_query(args, user, str(project["_id"]))
+    if err:
+        return None, err
+    date_from, date_to, period_label = period_range(args)
+    if date_from or date_to:
+        query["transaction_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+
+    partners = [p for p in project.get("partners", []) if p.get("active", True)]
+    pids = [p["id"] for p in partners]
+    pname = {p["id"]: p["name"] for p in partners}
+    share_pct = {p["id"]: p["share"] for p in partners}
+    available = {c["key"] for c in custom_report_columns(project)}
+    wanted = [c for c in wanted if c in available]
+    if not wanted and rows_mode == "expense":
+        wanted = ["date", "expense", "category", "total"] + [f"paid:{pid}" for pid in pids]
+
+    # one base record per expense
+    records = []
+    for e in expenses_col.find(query).sort([("transaction_date", ASCENDING), ("expense_id", ASCENDING)]):
+        path = e.get("category_path") or ["Uncategorised"]
+        paid = {x["partner_id"]: float(x["amount"]) for x in e.get("payments", [])}
+        rec = {"date": e["transaction_date"].strftime("%d-%m-%Y"), "month": e["transaction_date"].strftime("%Y-%m"), "expense": e["description"],
+               "expense_id": e["expense_id"], "category": path[0], "subcategory": " > ".join(path[1:]), "vendor": e.get("vendor") or "",
+               "payment_method": e.get("payment_method") or "", "payment_status": e.get("payment_status") or "", "notes": e.get("notes") or "",
+               "total": float(e["amount"]), "count": 1}
+        for f in project.get("custom_fields", []):
+            rec[f"custom:{f['key']}"] = (e.get("custom") or {}).get(f["key"], "")
+        for pid in pids:
+            rec[f"paid:{pid}"] = paid.get(pid, 0.0)
+            rec[f"share:{pid}"] = round(rec["total"] * share_pct[pid] / 100, 2)
+            rec[f"diff:{pid}"] = round(rec[f"paid:{pid}"] - rec[f"share:{pid}"], 2)
+        records.append(rec)
+    grand = sum(r["total"] for r in records) or 0.0
+    numeric_keys = ["total", "count"] + [f"{k}:{pid}" for pid in pids for k in ("paid", "share", "diff")]
+
+    def finish(rec, running):
+        rec["pct_total"] = round(rec["total"] / grand * 100, 2) if grand else 0.0
+        for pid in pids:
+            running[pid] = round(running.get(pid, 0.0) + rec[f"diff:{pid}"], 2)
+            rec[f"running:{pid}"] = running[pid]
+        variables = {"Total": rec["total"], "Count": rec["count"], "Pct": rec["pct_total"]}
+        for pid in pids:
+            n = _ident(pname[pid])
+            variables[f"{n}_paid"], variables[f"{n}_share"], variables[f"{n}_diff"] = rec[f"paid:{pid}"], rec[f"share:{pid}"], rec[f"diff:{pid}"]
+        for f in formulas:
+            try:
+                rec[f"formula:{f['label']}"] = safe_eval(f["expr"], variables)
+            except Exception as exc:
+                rec[f"formula:{f['label']}"] = f"error: {exc}"[:60]
+        return rec
+
+    def aggregate(key_fn, label):
+        groups = {}
+        for r in records:
+            g_ = groups.setdefault(key_fn(r), {"label": key_fn(r), "total": 0.0, "count": 0, **{k: 0.0 for k in numeric_keys if k not in ("total", "count")}})
+            for k in numeric_keys:
+                g_[k] += r[k]
+        out = []
+        running = {}
+        for g_ in sorted(groups.values(), key=lambda x: (-x["total"]) if label != "Month" else x["label"]):
+            out.append(finish(dict(g_, **{k: round(v, 2) for k, v in g_.items() if isinstance(v, float)}), running))
+        return out
+
+    # build the table
+    head, table = [], []
+    cols_meta = {c["key"]: c for c in custom_report_columns(project)}
+    def col_label(k):
+        return k.split(":", 1)[1] if k.startswith("formula:") else cols_meta.get(k, {}).get("label", k)
+
+    if rows_mode == "partner":
+        head = ["Partner", "Share %", "Should bear", "Paid", "Paid − share", "% of total", "Count"] + [f["label"] for f in formulas]
+        for pid in pids:
+            paid_sum = round(sum(r[f"paid:{pid}"] for r in records), 2)
+            should = round(grand * share_pct[pid] / 100, 2)
+            variables = {"Total": grand, "Count": len(records), "Paid": paid_sum, "Share": should, "Diff": round(paid_sum - should, 2)}
+            row = [pname[pid], f"{share_pct[pid]:g}%", should, paid_sum, round(paid_sum - should, 2), round(paid_sum / grand * 100, 2) if grand else 0.0,
+                   sum(1 for r in records if r[f"paid:{pid}"])]
+            for f in formulas:
+                try:
+                    row.append(safe_eval(f["expr"], variables))
+                except Exception as exc:
+                    row.append(f"error: {exc}"[:60])
+            table.append(row)
+        table.append(["TOTAL", "100%", round(grand, 2), round(grand, 2), 0.0, 100.0, len(records)] + [""] * len(formulas))
+        return {"head": head, "rows": table, "period": period_label, "row_mode": rows_mode, "count": len(records)}, None
+
+    numeric_wanted = [c for c in wanted if c in numeric_keys or c == "pct_total" or c.startswith("running:")]
+    text_wanted = [c for c in wanted if c not in numeric_wanted]
+    if rows_mode == "expense":
+        keys = wanted + [f"formula:{f['label']}" for f in formulas]
+        head = [col_label(k) for k in keys]
+        running = {}
+        if group_by:
+            key_fn = (lambda r: r["category"]) if group_by == "category" else (lambda r: r["subcategory"] or "(none)") if group_by == "subcategory" else \
+                     (lambda r: r["month"]) if group_by == "month" else (lambda r: r["vendor"] or "(none)") if group_by == "vendor" else \
+                     (lambda r: ", ".join(pname[pid] for pid in pids if r[f"paid:{pid}"]) or "(none)")
+            groups = {}
+            for r in records:
+                groups.setdefault(key_fn(r), []).append(r)
+            order = sorted(groups.items(), key=lambda kv: kv[0] if group_by == "month" else -sum(x["total"] for x in kv[1]))
+            for gkey, items in order:
+                table.append([f"— {gkey} —"] + [""] * (len(keys) - 1))
+                sub = {k: 0.0 for k in keys}
+                for r in items:
+                    r = finish(r, running)
+                    table.append([r.get(k, "") if not (isinstance(r.get(k), float) and r.get(k) == 0 and k != "pct_total") else "" for k in keys])
+                    for k in keys:
+                        if isinstance(r.get(k), (int, float)) and not k.startswith("running:"):
+                            sub[k] += r[k]
+                table.append([("Subtotal " + gkey) if i == 0 else (round(sub[k], 2) if (k in numeric_keys or k == "pct_total" or k.startswith("formula:")) and i > 0 else "")
+                              for i, k in enumerate(keys)])
+        else:
+            for r in records:
+                r = finish(r, running)
+                table.append([r.get(k, "") if not (isinstance(r.get(k), float) and r.get(k) == 0 and k != "pct_total") else "" for k in keys])
+        totals = {k: round(sum(r[k] for r in records if isinstance(r.get(k), (int, float))), 2) for k in keys if k in numeric_keys or k == "pct_total"}
+        table.append([("TOTAL" if i == 0 else totals.get(k, "")) for i, k in enumerate(keys)])
+    else:
+        key_name = {"category": ("category", "Category"), "subcategory": ("subcategory", "Subcategory"), "month": ("month", "Month"), "vendor": ("vendor", "Vendor")}[rows_mode]
+        rows_agg = aggregate(lambda r: r[key_name[0]] or "(none)", key_name[1])
+        keys = [k for k in wanted if k in numeric_keys or k == "pct_total"] or ["total", "count"]
+        keys = keys + [f"formula:{f['label']}" for f in formulas]
+        head = [key_name[1]] + [col_label(k) for k in keys]
+        for r in rows_agg:
+            table.append([r["label"]] + [r.get(k, "") if not (isinstance(r.get(k), float) and r.get(k) == 0 and k != "pct_total") else "" for k in keys])
+        table.append(["TOTAL"] + [round(sum(r[k] for r in rows_agg if isinstance(r.get(k), (int, float))), 2) if (k in numeric_keys or k == "pct_total") else "" for k in keys])
+    return {"head": head, "rows": table, "period": period_label, "row_mode": rows_mode, "count": len(records),
+            "ignored_text_columns": [col_label(c) for c in text_wanted] if rows_mode != "expense" else []}, None
+
+
+@app.route("/api/reports/custom/options")
+@require("expense:view")
+@require_project
+def api_custom_options():
+    partners = [p for p in g.project.get("partners", []) if p.get("active", True)]
+    variables = ["Total", "Count", "Pct"] + [f"{_ident(p['name'])}_{k}" for p in partners for k in ("paid", "share", "diff")]
+    return jsonify({"columns": custom_report_columns(g.project), "row_modes": ROW_MODES, "group_modes": GROUP_MODES, "formula_variables": variables,
+                    "categories": [{"id": str(c["_id"]), "name": c["name"]} for c in categories_col.find({"project_id": g.project_id, "level": 0, "status": "active"}).sort("sort_order", 1)]})
+
+
+@app.route("/api/reports/custom/run", methods=["POST"])
+@require("expense:view")
+@require_project
+def api_custom_run():
+    result, err = run_custom_report(g.project, request.get_json(silent=True) or {}, g.user)
+    if err:
+        return json_error(err)
+    return jsonify(result)
+
+
+@app.route("/api/reports/custom/download.<fmt>")
+@require("export")
+@require_project
+def api_custom_download(fmt):
+    if fmt not in ("csv", "pdf"):
+        abort(404)
+    spec = None
+    if request.args.get("report_id"):
+        doc = custom_reports_col.find_one({"_id": to_oid(request.args["report_id"]), "project_id": g.project_id})
+        spec = doc["spec"] if doc else None
+        name = doc["name"] if doc else "custom"
+    else:
+        try:
+            spec = json.loads(request.args.get("spec") or "{}")
+        except ValueError:
+            return json_error("Bad report definition.")
+        name = clean_str(request.args.get("name"), 60) or "custom"
+    if spec is None:
+        return json_error("Report not found.", 404)
+    result, err = run_custom_report(g.project, spec, g.user)
+    if err:
+        return json_error(err)
+    record_audit(f"custom_report_{fmt}", "export", name, {"period": result["period"]})
+    filename = f"{_ident(name).lower()}_{utcnow().strftime('%Y%m%d_%H%M')}.{fmt}"
+    sheets = [(None, result["head"], result["rows"])]
+    if fmt == "csv":
+        return csv_response(filename, sheets)
+    subtitle = f"Project: {g.project['name']} · Period: {result['period']} · {result['count']} expenses · Generated {utcnow().strftime('%d-%m-%Y %H:%M')} UTC by {user_display(g.user)}"
+    return pdf_response(filename, f"{name} — {g.project['name']}", subtitle, sheets, landscape_mode=len(result["head"]) > 6)
+
+
+@app.route("/api/reports/custom")
+@require("expense:view")
+@require_project
+def api_custom_list():
+    docs = list(custom_reports_col.find({"project_id": g.project_id}).sort("name", ASCENDING))
+    return jsonify({"reports": serialize(docs)})
+
+
+@app.route("/api/reports/custom", methods=["POST"])
+@require("expense:edit")
+@require_project
+def api_custom_save():
+    data = request.get_json(silent=True) or {}
+    name = clean_str(data.get("name"), 60)
+    spec = data.get("spec") or {}
+    if len(name) < 2 or not isinstance(spec, dict):
+        return json_error("Give the report a name.")
+    key = {"project_id": g.project_id, "name": name}
+    custom_reports_col.update_one(key, {"$set": dict(key, spec=spec, updated_at=utcnow(), updated_by=user_display(g.user)),
+                                        "$setOnInsert": {"created_at": utcnow(), "created_by": user_display(g.user)}}, upsert=True)
+    record_audit("custom_report_saved", "report", name, {"rows": spec.get("rows"), "columns": spec.get("columns")})
+    return jsonify({"report": serialize(custom_reports_col.find_one(key))}), 201
+
+
+@app.route("/api/reports/custom/<report_id>", methods=["DELETE"])
+@require("expense:edit")
+@require_project
+def api_custom_delete(report_id):
+    doc = custom_reports_col.find_one({"_id": to_oid(report_id), "project_id": g.project_id}) if to_oid(report_id) else None
+    if not doc:
+        return json_error("Report not found.", 404)
+    custom_reports_col.delete_one({"_id": doc["_id"]})
+    record_audit("custom_report_deleted", "report", doc["name"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/export/json")
 @require("export")
 @require_project
@@ -1860,7 +2153,7 @@ def api_export_json():
 # ---------------------------------------------------------------------------
 
 BACKUP_VERSION = 2
-BACKUP_COLLECTIONS = ["projects", "expenses", "categories", "expense_revisions", "audit_logs", "dashboard_preferences", "saved_filters", "counters", "users"]
+BACKUP_COLLECTIONS = ["projects", "expenses", "categories", "expense_revisions", "audit_logs", "dashboard_preferences", "saved_filters", "custom_reports", "counters", "users"]
 _backup_event = threading.Event()
 _backup_reasons = []
 _backup_lock = threading.Lock()

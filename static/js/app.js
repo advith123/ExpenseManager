@@ -222,12 +222,12 @@
   function render() {
     var token = ++renderToken;
     var route = parseHash(), main = $("#main");
-    $$(".nav-link").forEach(function (a) { a.classList.toggle("active", a.getAttribute("data-view") === route.path.split("/")[0]); });
+    $$(".nav-link").forEach(function (a) { var v = route.path.split("/")[0]; a.classList.toggle("active", a.getAttribute("data-view") === (v === "custom" ? "reports" : v)); });
     var name = route.path.split("/")[0];
     var view = views[name] || views.dashboard;
     main.innerHTML = '<div class="empty">Loading…</div>';
     closeModal();
-    var needsProject = ["dashboard", "expenses", "categories", "reports"].indexOf(name) >= 0;
+    var needsProject = ["dashboard", "expenses", "categories", "reports", "custom"].indexOf(name) >= 0;
     if (needsProject && !state.project) {
       main.innerHTML = '<div class="panel"><h2>No project yet</h2><p>Create your first project to start recording expenses.</p>' + (can("project:manage") ? '<a class="btn btn-primary" href="#/projects">Go to Projects &amp; partners</a>' : "") + '</div>';
       return;
