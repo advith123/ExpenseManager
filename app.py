@@ -1669,7 +1669,7 @@ def csv_response(filename, sheets):
             w.writerow([title])
         w.writerow(head)
         for r in rows:
-            w.writerow(r)
+            w.writerow([int(v) if isinstance(v, float) and v.is_integer() else v for v in r])
     return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
@@ -1687,19 +1687,29 @@ def pdf_response(filename, title, subtitle, sheets, landscape_mode=False):
     page = landscape(A4) if landscape_mode else A4
     doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=12 * mm, rightMargin=12 * mm, topMargin=14 * mm, bottomMargin=14 * mm, title=title)
     styles = getSampleStyleSheet()
+    from reportlab.lib.enums import TA_RIGHT
     cell = ParagraphStyle("cell", parent=styles["BodyText"], fontSize=7.5, leading=9)
+    cell_r = ParagraphStyle("cell_r", parent=cell, alignment=TA_RIGHT)
     story = [Paragraph(title, styles["Title"]), Paragraph(subtitle, styles["Normal"]), Spacer(1, 6)]
     for sheet_title, head, rows in sheets:
         if sheet_title:
             story += [Spacer(1, 8), Paragraph(sheet_title, styles["Heading3"])]
-        data = [[Paragraph(str(h), cell) for h in head]]
+        numeric = [any(isinstance(r[i], float) for r in rows if i < len(r)) for i in range(len(head))]
+        data = [[Paragraph(str(h), cell_r if numeric[i] else cell) for i, h in enumerate(head)]]
         for r in rows:
-            data.append([Paragraph(fmt_inr(v) if isinstance(v, float) else str(v if v is not None else ""), cell) for v in r])
+            data.append([Paragraph(fmt_inr(v) if isinstance(v, float) else str(v if v is not None else ""), cell_r if numeric[i] else cell) for i, v in enumerate(r)])
         if len(data) == 1:
             data.append([Paragraph("No records", cell)] + [""] * (len(head) - 1))
         tbl = Table(data, repeatRows=1)
-        tbl.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e3efe9")), ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#b9c2bc")),
-                                 ("VALIGN", (0, 0), (-1, -1), "TOP"), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f8f6")])]))
+        style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e3efe9")), ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#b9c2bc")),
+                 ("VALIGN", (0, 0), (-1, -1), "TOP"), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f8f6")])]
+        for ri, r in enumerate(rows, start=1):
+            first = str(r[0]) if r else ""
+            if first.startswith("TOTAL") or first.startswith("Subtotal"):
+                style.append(("BACKGROUND", (0, ri), (-1, ri), colors.HexColor("#d7e6de")))
+            elif first.startswith("—"):
+                style.append(("BACKGROUND", (0, ri), (-1, ri), colors.HexColor("#eef2ef")))
+        tbl.setStyle(TableStyle(style))
         story.append(tbl)
     doc.build(story)
     buf.seek(0)
@@ -1743,7 +1753,12 @@ def api_report(kind, fmt):
     if kind == "category":
         sheets, title = [cat_sheet, sub_sheet], "Category-wise report"
     elif kind == "partner":
-        sheets, title = [partner_sheet, settle_sheet, partner_cat], "Partner-wise report"
+        pay_head, pay_rows = partner_payment_rows(g.project, query, ps["partners"])
+        cat_head, cat_rows = partner_rows_by_category(g.project, query, ps["partners"])
+        sheets, title = [("Payments by partner — all expenses", pay_head, pay_rows),
+                         ("Category-wise totals", ["Category"] + [p["name"] for p in ps["partners"]] + ["Total"], partner_by_category(g.project, query, ps["partners"])),
+                         ("Category-wise — every expense", cat_head, cat_rows),
+                         partner_sheet, settle_sheet], "Partner-wise report"
     elif kind == "expenses":
         sheets, title = [expenses_sheet], "Expenses"
     else:
@@ -1754,7 +1769,46 @@ def api_report(kind, fmt):
     filename = f"{kind}_report_{stamp}.{fmt}"
     if fmt == "csv":
         return csv_response(filename, sheets)
-    return pdf_response(filename, f"{title} — {g.project['name']}", subtitle, sheets, landscape_mode=(kind in ("full", "expenses")))
+    return pdf_response(filename, f"{title} — {g.project['name']}", subtitle, sheets, landscape_mode=(kind in ("full", "expenses", "partner")))
+
+
+def partner_payment_rows(project, query, partner_rows):
+    """Expense | Date | Category | Total | <partner 1> | <partner 2> ... one row per expense, plus a total row."""
+    head = ["Expense", "Date", "Category", "Total (INR)"] + [p["name"] for p in partner_rows]
+    rows, sums = [], [0.0] * len(partner_rows)
+    grand = 0.0
+    for e in expenses_col.find(query).sort([("transaction_date", ASCENDING), ("expense_id", ASCENDING)]):
+        paid = {x["partner_id"]: x["amount"] for x in e.get("payments", [])}
+        amounts = [float(paid.get(p["partner_id"], 0)) for p in partner_rows]
+        for i, a in enumerate(amounts):
+            sums[i] += a
+        grand += e["amount"]
+        rows.append([e["description"], e["transaction_date"].strftime("%d-%m-%Y"), " > ".join(e.get("category_path") or []), float(e["amount"])] + [a or "" for a in amounts])
+    rows.append(["TOTAL", "", "", round(grand, 2)] + [round(x, 2) for x in sums])
+    return head, rows
+
+
+def partner_rows_by_category(project, query, partner_rows):
+    """Same table but grouped under each category with a subtotal line per category."""
+    head = ["Expense", "Date", "Subcategory", "Total (INR)"] + [p["name"] for p in partner_rows]
+    groups = {}
+    for e in expenses_col.find(query).sort([("transaction_date", ASCENDING)]):
+        path = e.get("category_path") or ["Uncategorised"]
+        groups.setdefault(path[0], []).append(e)
+    rows = []
+    for cat, items in sorted(groups.items(), key=lambda kv: -sum(x["amount"] for x in kv[1])):
+        rows.append([f"— {cat} —", "", "", "", *([""] * len(partner_rows))])
+        sub = [0.0] * len(partner_rows)
+        total = 0.0
+        for e in items:
+            paid = {x["partner_id"]: x["amount"] for x in e.get("payments", [])}
+            amounts = [float(paid.get(p["partner_id"], 0)) for p in partner_rows]
+            for i, a in enumerate(amounts):
+                sub[i] += a
+            total += e["amount"]
+            rows.append([e["description"], e["transaction_date"].strftime("%d-%m-%Y"), " > ".join((e.get("category_path") or [])[1:]), float(e["amount"])] + [a or "" for a in amounts])
+        rows.append([f"Subtotal {cat}", "", "", round(total, 2)] + [round(x, 2) or "" for x in sub])
+    return head, rows
 
 
 def partner_by_category(project, query, partner_rows):
@@ -1767,6 +1821,22 @@ def partner_by_category(project, query, partner_rows):
     for cat, paid in sorted(by_cat.items(), key=lambda kv: -sum(kv[1].values())):
         out.append([cat] + [float(paid.get(p["partner_id"], 0)) for p in partner_rows] + [float(sum(paid.values()))])
     return out
+
+
+@app.route("/api/reports/partner-table")
+@require("expense:view")
+@require_project
+def api_partner_table():
+    query, err = build_expense_query(request.args, g.user, g.project_id)
+    if err:
+        return json_error(err)
+    date_from, date_to, _ = period_range(request.args)
+    if date_from or date_to:
+        query["transaction_date"] = {k: v for k, v in (("$gte", date_from), ("$lte", date_to)) if v}
+    partners = [{"partner_id": p["id"], "name": p["name"]} for p in g.project.get("partners", []) if p.get("active", True)]
+    head, rows = partner_payment_rows(g.project, query, partners)
+    return jsonify({"head": head, "rows": rows[-401:], "truncated": len(rows) > 401, "total_rows": len(rows) - 1,
+                    "by_category": partner_by_category(g.project, query, partners)})
 
 
 @app.route("/api/export/json")
