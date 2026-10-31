@@ -319,7 +319,7 @@ def current_user():
 def load_user():
     g.user = None
     g.project_id = None
-    if request.path.startswith("/static/"):
+    if request.path.startswith("/static/") or request.path in ("/ping", "/health"):
         return None
     if session.get("user_id"):
         last = session.get("last_active")
@@ -716,6 +716,13 @@ def import_seed_ledger():
 # ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
+
+@app.route("/ping")
+@app.route("/health")
+def ping():
+    """Keep-alive target for cron-job.org / uptime monitors. Returns plain '1' and touches nothing."""
+    return Response("1", mimetype="text/plain", headers={"Cache-Control": "no-store"})
+
 
 @app.route("/login")
 def login_page():

@@ -37,7 +37,7 @@ Open http://localhost:5000 — sign in as `admin` / `Admin@12345` and set a new 
 
 Build: `pip install -r requirements.txt` · Start: `gunicorn -w 2 -b 0.0.0.0:$PORT --timeout 120 app:app`
 Environment: `MONGODB_USERNAME`, `MONGODB_PASSWORD`, `EM_SECRET_KEY` (long random text), `EM_SECURE_COOKIES=1`, `EM_FIRM_NAME`.
-Allow `0.0.0.0/0` in Atlas → Network Access. Note the `backups/` folder is wiped on each redeploy on free tiers — download a backup regularly.
+Allow `0.0.0.0/0` in Atlas → Network Access. To stop the free instance sleeping, point a cron-job.org job at `https://<your-app>.onrender.com/ping` every 10 minutes — it returns `1` and touches nothing. Note the `backups/` folder is wiped on each redeploy on free tiers — download a backup regularly.
 Set `EM_DEBUG=1` temporarily to see the real error text in API responses when something returns "Something went wrong".
 
 ## Files
