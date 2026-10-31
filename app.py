@@ -675,6 +675,7 @@ def upgrade_all_projects():
             log.exception("Category upgrade failed for %s: %s", proj.get("name"), exc)
 
 
+
 def import_seed_ledger():
     """Create the Restaurant project and import the partners' ledger from seed_data.py."""
     sp = seed_data.PROJECT
