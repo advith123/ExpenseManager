@@ -247,7 +247,6 @@ OLD_DEFAULT_CATEGORY_NAMES = {
     "Marketing and Signage", "Rent", "Miscellaneous Expenses", "Rent and Security Deposit", "Electrical and Plumbing",
     "Licenses and Registrations", "Raw Materials and Groceries", "Staff Salaries", "Marketing and Advertising", "Packaging and Delivery",
     "Utilities and Maintenance", "Transportation",
-
 }
 
 

@@ -12,21 +12,51 @@
       if (!isCurrent()) return;
       if (showArchived) state.categories = { flat: d.flat.filter(function (c) { return c.status === "active"; }), tree: [] };
       var manage = can("category:manage");
-      function node(c) {
-        var usage = c.usage.count ? c.usage.count + ' expense' + (c.usage.count === 1 ? "" : "s") + ' · ' + fmtINR(c.usage.total, 0) : "unused";
-        var acts = manage ? (c.status === "active"
-          ? '<button class="link-btn" data-add="' + esc(c.id) + '">+ Sub</button><button class="link-btn" data-edit="' + esc(c.id) + '">Rename</button><button class="link-btn danger" data-archive="' + esc(c.id) + '">Archive</button>'
-          : '<button class="link-btn" data-unarchive="' + esc(c.id) + '">Restore</button>') : "";
-        return '<li><div class="cat-row' + (c.status === "archived" ? " archived" : "") + '"><span class="name">' + esc(c.name) + '</span><button class="link-btn usage" data-view="' + esc(c.id) + '" title="View expenses">' + usage + '</button><span class="cat-actions">' + acts + '</span></div>' +
-          (c.children.length ? '<ul>' + c.children.map(node).join("") + '</ul>' : "") + '</li>';
+      var tops = d.tree, subCount = d.flat.filter(function (c) { return c.level > 0; }).length;
+      var grand = tops.reduce(function (a, c) { return a + c.usage.total; }, 0);
+      var open = {};
+      function fmtUse(u) { return u.count ? fmtINR(u.total, 0) + ' <span class="muted">· ' + u.count + '</span>' : '<span class="muted">—</span>'; }
+      function rowActions(c) {
+        if (!manage) return "";
+        return c.status === "active"
+          ? '<button class="icon-btn sm" data-edit="' + esc(c.id) + '" title="Rename">✎</button><button class="icon-btn sm" data-archive="' + esc(c.id) + '" title="Archive">⌫</button>'
+          : '<button class="link-btn" data-unarchive="' + esc(c.id) + '">Restore</button>';
       }
-      main.innerHTML = '<div class="panel"><div class="panel-head"><h2>Categories</h2><div class="btn-row"><label class="small"><input type="checkbox" id="cat-archived"' + (showArchived ? " checked" : "") + '> Show archived</label>' +
-        (manage ? '<button class="btn btn-primary btn-sm" id="cat-new">+ New category</button>' : "") + '</div></div><ul class="cat-tree" id="cat-tree">' + d.tree.map(node).join("") + '</ul></div>';
+      function card(c, q) {
+        var kids = c.children, match = !q || c.name.toLowerCase().indexOf(q) >= 0;
+        var shown = q ? kids.filter(function (k) { return k.name.toLowerCase().indexOf(q) >= 0 || match; }) : kids;
+        if (q && !match && !shown.length) return "";
+        var isOpen = open[c.id] || !!q;
+        var pct = grand ? Math.round(c.usage.total / grand * 100) : 0;
+        return '<section class="cat-card' + (c.status === "archived" ? " archived" : "") + '" data-card="' + esc(c.id) + '">' +
+          '<header class="cat-card-head" data-toggle="' + esc(c.id) + '"><span class="chev">' + (isOpen ? "▾" : "▸") + '</span>' +
+          '<div class="cat-card-title"><strong>' + esc(c.name) + '</strong><span class="muted small">' + kids.length + ' subcategor' + (kids.length === 1 ? "y" : "ies") + (c.status === "archived" ? " · archived" : "") + '</span></div>' +
+          '<div class="cat-card-usage amount">' + fmtUse(c.usage) + (c.usage.count ? '<span class="track"><span class="fill" style="width:' + pct + '%"></span></span>' : "") + '</div>' +
+          '<div class="cat-card-actions">' + rowActions(c) + '</div></header>' +
+          (isOpen ? '<div class="cat-card-body"><table class="data sub-table"><tbody>' +
+            (shown.length ? shown.map(function (k) {
+              return '<tr class="' + (k.status === "archived" ? "archived" : "") + '"><td class="sub-name"><button class="link-btn plain" data-view="' + esc(k.id) + '" title="Show expenses">' + esc(k.name) + '</button>' + (k.status === "archived" ? ' <span class="tag">archived</span>' : "") + '</td><td class="amount">' + fmtUse(k.usage) + '</td><td class="sub-actions">' + rowActions(k) + '</td></tr>';
+            }).join("") : '<tr><td colspan="3" class="muted small">No subcategories yet.</td></tr>') +
+            '</tbody></table>' +
+            '<div class="cat-card-foot"><button class="link-btn plain" data-view="' + esc(c.id) + '">View all ' + esc(c.name) + ' expenses →</button>' + (manage && c.status === "active" ? '<button class="btn btn-sm" data-add="' + esc(c.id) + '">+ Add subcategory</button>' : "") + '</div></div>' : "") +
+          '</section>';
+      }
+      main.innerHTML = '<div class="panel"><div class="panel-head"><div><h2>Categories</h2><p class="muted small" style="margin:0">' + tops.filter(function (c) { return c.status === "active"; }).length + ' categories · ' + subCount + ' subcategories · ' + fmtINR(grand, 0) + ' recorded</p></div>' +
+        '<div class="btn-row">' + (manage ? '<button class="btn btn-primary btn-sm" id="cat-new">+ New category</button>' : "") + '</div></div>' +
+        '<div class="cat-toolbar"><input type="search" id="cat-q" placeholder="Search categories and subcategories…" aria-label="Search"><button class="btn btn-sm" id="cat-expand">Expand all</button><button class="btn btn-sm" id="cat-collapse">Collapse all</button><label class="chk"><input type="checkbox" id="cat-archived"' + (showArchived ? " checked" : "") + '> Show archived</label></div>' +
+        '<div class="cat-cards" id="cat-cards"></div></div>';
+      var box = $("#cat-cards");
+      function draw() { var q = $("#cat-q").value.trim().toLowerCase(); box.innerHTML = tops.map(function (c) { return card(c, q); }).join("") || '<div class="empty">Nothing matches.</div>'; }
+      draw();
+      $("#cat-q").addEventListener("input", draw);
+      $("#cat-expand").addEventListener("click", function () { tops.forEach(function (c) { open[c.id] = true; }); draw(); });
+      $("#cat-collapse").addEventListener("click", function () { open = {}; draw(); });
       $("#cat-archived").addEventListener("change", function () { navigate("categories", this.checked ? { archived: "1" } : {}); });
       if ($("#cat-new")) $("#cat-new").addEventListener("click", function () { categoryForm(null, null); });
-      $("#cat-tree").addEventListener("click", function (e) {
-        var t = e.target.closest("button"); if (!t) return;
+      box.addEventListener("click", function (e) {
+        var t = e.target.closest("button, [data-toggle]"); if (!t) return;
         var id, c;
+        if (t.hasAttribute("data-toggle") && !e.target.closest("button")) { id = t.getAttribute("data-toggle"); open[id] = !open[id]; draw(); return; }
         if ((id = t.getAttribute("data-view"))) { c = d.flat.filter(function (x) { return x.id === id; })[0]; navigate("expenses", c.level === 0 ? { category_id: id } : { category_id: c.path_ids[0], subcategory_id: id }); }
         else if ((id = t.getAttribute("data-add"))) categoryForm(null, id);
         else if ((id = t.getAttribute("data-edit"))) categoryForm(d.flat.filter(function (x) { return x.id === id; })[0], null);
