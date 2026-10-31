@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Expense Manager</title>
+  <title>{{ firm_name }} · Expense Manager</title>
   <meta name="csrf-token" content="{{ csrf_token }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -14,15 +14,20 @@
     <aside class="sidebar" id="sidebar" aria-label="Main navigation">
       <div class="sidebar-brand">
         <span class="brand-mark" aria-hidden="true">₹</span>
-        <span class="brand-name">Expense Manager</span>
+        <span class="brand-name">{{ firm_name }}</span>
         <button class="icon-btn sidebar-close" id="sidebar-close" aria-label="Close menu">✕</button>
       </div>
       <nav class="nav" id="nav">
+        <div class="nav-project">
+          <label for="project-select">Project</label>
+          <select id="project-select" aria-label="Current project"></select>
+        </div>
         <a href="#/dashboard" data-view="dashboard" class="nav-link">Dashboard</a>
         <a href="#/expenses" data-view="expenses" class="nav-link">Expenses</a>
         <a href="#/categories" data-view="categories" class="nav-link">Categories</a>
+        <a href="#/reports" data-view="reports" class="nav-link" data-perm="export">Reports</a>
         <a href="#/history" data-view="history" class="nav-link" data-perm="audit:view">History &amp; audit</a>
-        <a href="#/reports" data-view="reports" class="nav-link" data-perm="export">Reports &amp; export</a>
+        <a href="#/projects" data-view="projects" class="nav-link">Projects &amp; partners</a>
         <a href="#/users" data-view="users" class="nav-link" data-perm="user:manage">Users</a>
         <a href="#/settings" data-view="settings" class="nav-link">Settings &amp; backups</a>
       </nav>
